@@ -107,7 +107,11 @@ func TestNewIdentityFromFile_RelativePath(t *testing.T) {
 	// Assertions
 	require.NoError(t, err)
 	require.NotNil(t, identity)
-	assert.Equal(t, keyFile, identity.KeyFile)
+	// macOS exposes /var through /private/var; chdir/getwd may return the
+	// physical path. Both spellings must identify the same absolute file.
+	resolvedKeyFile, resolveErr := filepath.EvalSymlinks(keyFile)
+	require.NoError(t, resolveErr)
+	assert.Equal(t, resolvedKeyFile, identity.KeyFile)
 	assert.Equal(t, privateKey.String(), identity.Key.String())
 	assert.Equal(t, privateKey.PublicKey().String(), identity.PubKey())
 }

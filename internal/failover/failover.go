@@ -32,7 +32,8 @@ const (
 	// History:
 	//   1 = original (pre-v0.1.18) — no version byte, implicit
 	//   2 = version byte added after msg_type / before first gob frame (v0.1.18+)
-	WireProtocolVersion byte = 2
+	// 3 adds mandatory demotion acknowledgement and fresh source proofs.
+	WireProtocolVersion byte = 3
 )
 
 // hookEnvMapParams is the parameters for the hook environment map

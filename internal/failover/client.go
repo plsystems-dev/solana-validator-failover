@@ -3,9 +3,9 @@ package failover
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/charmbracelet/huh/spinner"
@@ -17,12 +17,12 @@ import (
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
 	"github.com/sol-strategies/solana-validator-failover/internal/solana"
 	"github.com/sol-strategies/solana-validator-failover/internal/style"
-	"github.com/sol-strategies/solana-validator-failover/internal/utils"
-	pkgconstants "github.com/sol-strategies/solana-validator-failover/pkg/constants"
 )
 
 // ClientConfig is the configuration for the failover client, client is always the active node
 type ClientConfig struct {
+	Safety                         safetyReader
+	MaxSlotLag                     uint64
 	ServerName                     string
 	ServerAddress                  string
 	ActiveNodeInfo                 *NodeInfo
@@ -42,6 +42,10 @@ type ClientConfig struct {
 
 // Client is the failover client - an active node connects to a passive node server to handover as active
 type Client struct {
+	safety                         safetyReader
+	maxSlotLag                     uint64
+	transport                      *quic.Transport
+	runCommand                     func(context.Context, string, bool) error
 	Conn                           *quic.Conn
 	ctx                            context.Context
 	cancel                         context.CancelFunc
@@ -63,7 +67,7 @@ type Client struct {
 
 // NewClientFromConfig creates a new QUIC client from a configuration
 func NewClientFromConfig(config ClientConfig) (client *Client, err error) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), transactionTimeout)
 
 	var clientTLSConfig *tls.Config
 	if config.TLSConfig != nil {
@@ -73,6 +77,9 @@ func NewClientFromConfig(config ClientConfig) (client *Client, err error) {
 	}
 
 	client = &Client{
+		safety:                         config.Safety,
+		maxSlotLag:                     config.MaxSlotLag,
+		runCommand:                     runIdentityCommand,
 		logger:                         log.Default(),
 		ctx:                            ctx,
 		cancel:                         cancel,
@@ -89,6 +96,9 @@ func NewClientFromConfig(config ClientConfig) (client *Client, err error) {
 		rollback:                       config.Rollback,
 		tlsConfig:                      clientTLSConfig,
 	}
+	if client.maxSlotLag == 0 {
+		client.maxSlotLag = DefaultMaxSlotLag
+	}
 
 	err = client.connectToServer()
 	if err != nil {
@@ -102,217 +112,47 @@ func NewClientFromConfig(config ClientConfig) (client *Client, err error) {
 }
 
 // Start starts the QUIC client
-func (c *Client) Start() {
-	c.logger.Debug("starting QUIC client")
-	var wentPassive bool
-
-	// open a bidirectional stream to the server
+func (c *Client) Start() (err error) {
+	defer c.cancel()
+	defer func() {
+		code := quic.ApplicationErrorCode(0)
+		if err != nil {
+			code = 1
+		}
+		_ = c.Conn.CloseWithError(code, "participant finished")
+	}()
+	if c.transport != nil {
+		defer c.transport.Close()
+	}
 	stream, err := c.Conn.OpenStreamSync(c.ctx)
 	if err != nil {
-		c.logger.Error("failed to open stream", "err", err)
-		return
+		return fmt.Errorf("open handover stream: %w", err)
 	}
-
-	c.logger.Debug("opened stream to server")
-
-	// send FailoverInitiateRequest
-	c.failoverStream = NewFailoverStream(stream)
-
-	// Send message type first
-	if _, err := c.failoverStream.Stream.Write([]byte{MessageTypeFailoverInitiateRequest}); err != nil {
-		c.logger.Error("failed to send message type", "err", err)
-		return
+	defer stream.Close()
+	if _, err := stream.Write([]byte{MessageTypeFailoverInitiateRequest}); err != nil {
+		return err
 	}
-
-	// Send wire protocol version before any gob encoding so the server can
-	// verify compatibility before attempting to decode the gob payload.
 	if err := writeWireVersion(stream); err != nil {
-		c.logger.Error("failed to send wire protocol version", "err", err)
-		return
+		return err
 	}
-
-	// send message with your own info
-	c.failoverStream.SetActiveNodeInfo(c.activeNodeInfo)
-	c.failoverStream.SetActiveRollbackEnabled(c.rollback.Enabled)
-	err = c.failoverStream.Encode()
-	if err != nil {
-		return
+	c.failoverStream = NewFailoverStream(stream)
+	if err := c.runSource(); err != nil {
+		return err
 	}
-
-	c.logger.Debug("sent message type")
-
-	// wait for failover signal from server before proceeding
-	sp := spinner.New().Title(style.RenderPinkString("connected to ") + style.RenderPassiveString(c.serverName, false) + style.RenderPinkString(", waiting for failover signal..."))
-	sp.ActionWithErr(func(ctx context.Context) error {
-		// Read the server's wire protocol version before any gob decoding.
-		// A mismatch here means the passive node is running an incompatible version.
-		if err := readAndCheckWireVersion(stream); err != nil {
-			return err
+	// Do not close the connection immediately after queuing complete-ack:
+	// that can discard the acknowledgement before the destination reads it.
+	// Only its successful, post-ack close confirms protocol completion.
+	select {
+	case <-c.Conn.Context().Done():
+		cause := context.Cause(c.Conn.Context())
+		var applicationError *quic.ApplicationError
+		if errors.As(cause, &applicationError) && applicationError.ErrorCode == 0 {
+			return nil
 		}
-		return c.failoverStream.Decode()
-	})
-	err = sp.Run()
-	if err != nil {
-		c.logger.Fatal("failed to wait for failover signal", "err", err)
-		return
+		return fmt.Errorf("destination did not close successfully: %w", cause)
+	case <-time.After(proofTimeout):
+		return fmt.Errorf("destination completion close timed out")
 	}
-
-	// ensure server is running the same version of this program
-	serverVersion := c.failoverStream.GetPassiveNodeInfo().SolanaValidatorFailoverVersion
-	clientVersion := pkgconstants.AppVersion
-	if serverVersion != clientVersion {
-		c.logger.Fatalf("server is running a different version of this program: %s (them) != %s (us)", serverVersion, clientVersion)
-		return
-	}
-
-	// see if the server says can proceed, else show error message and exit
-	if !c.failoverStream.GetCanProceed() {
-		c.logger.Fatal(c.failoverStream.GetErrorMessage())
-		return
-	}
-
-	// Get skipTowerSync from the server's message (server is the authority on this)
-	skipTowerSync := c.failoverStream.GetSkipTowerSync()
-
-	// wait until the next leader slot is at least the minimum time to leader slot
-	err = c.waitMinTimeToLeaderSlot()
-	if err != nil {
-		c.logger.Fatal("failed to wait for next leader slot", "err", err)
-		return
-	}
-
-	// run pre hooks when active
-	err = c.hooks.RunPreWhenActive(c.getHookEnvMap(hookEnvMapParams{
-		isDryRunFailover: c.failoverStream.GetIsDryRunFailover(),
-		isPreFailover:    true,
-	}))
-	if err != nil {
-		c.logger.Fatal("failed to run pre hooks when active", "err", err)
-		return
-	}
-
-	c.logger.Info("failover started")
-
-	// wait until the next slot starts so we switch right at the beginning of the next slot
-	// this ensures we're early in the slot when we start the switch
-	slot, err := c.waitUntilStartOfNextSlot()
-	if err != nil {
-		c.logger.Fatal("failed to wait for next slot to start", "err", err)
-		return
-	}
-
-	// set the failover start slot to the current slot (we're now early in this slot)
-	c.failoverStream.SetFailoverStartSlot(slot)
-
-	// set identity to passive
-	dryRunPrefix := ""
-	if c.failoverStream.GetIsDryRunFailover() {
-		dryRunPrefix = style.RenderLightGreyString("(dry run)") + " "
-	}
-	c.logger.Info(dryRunPrefix +
-		style.RenderPinkString("changing to ") +
-		style.RenderPassiveString(constants.NodeRolePassive, false) +
-		style.RenderPinkString(" identity"))
-
-	c.failoverStream.SetActiveNodeSetIdentityStartTime()
-
-	err = utils.RunCommand(utils.RunCommandParams{
-		CommandSlice: strings.Split(c.failoverStream.GetActiveNodeInfo().SetIdentityCommand, " "),
-		DryRun:       c.failoverStream.GetIsDryRunFailover(),
-		LogDebug:     c.logger.GetLevel() <= log.DebugLevel,
-	})
-	if err != nil {
-		c.logger.Error("failed to set identity to passive", "err", err)
-		return
-	}
-	c.failoverStream.SetActiveNodeSetIdentityEndTime()
-	wentPassive = true // this node is now passive; used below for rollback/warning decisions
-
-	if skipTowerSync {
-		c.logger.Info("skipping tower file sync")
-		// Don't send anything - server won't wait for tower file when skipTowerSync is true
-	} else {
-		c.logger.Infof("sending tower file to %s", style.RenderPassiveString(c.failoverStream.GetPassiveNodeInfo().Hostname, false))
-
-		// Read the tower file into TowerFileBytes
-		c.failoverStream.SetActiveNodeSyncTowerFileStartTime()
-		err = c.failoverStream.GetActiveNodeInfo().SetTowerFileBytes()
-		if err != nil {
-			c.logger.Error(fmt.Sprintf("failed to set tower file bytes for %s", c.failoverStream.GetActiveNodeInfo().TowerFile), "err", err)
-			return
-		}
-		c.failoverStream.SetActiveNodeSyncTowerFileEndTime()
-
-		// Send the updated node info with tower file bytes
-		if err := c.failoverStream.Encode(); err != nil {
-			c.logger.Error(fmt.Sprintf("failed to send tower file bytes for %s", c.failoverStream.GetActiveNodeInfo().TowerFile), "err", err)
-			if wentPassive {
-				c.logger.Error(
-					"CRITICAL: tower sync failed after this node switched to passive — " +
-						"the passive node has not changed identity; check gossip and intervene manually if needed",
-				)
-				if c.rollback.ToActive.ResolvedCmd != "" {
-					c.logger.Errorf("if this node needs to revert to active: %s", c.rollback.ToActive.ResolvedCmd)
-				}
-			}
-			return
-		}
-	}
-
-	// wait for confirmation from server that failover is complete
-	err = c.failoverStream.Decode()
-	if err != nil {
-		c.logger.Error("failed to decode failover stream", "err", err)
-		if wentPassive {
-			// The connection dropped after this node switched to passive.
-			// We cannot know whether the server successfully set its identity — do NOT
-			// auto-rollback (risk of two active validators). Check gossip manually.
-			c.logger.Error(
-				"CRITICAL: connection lost after this node switched to passive — " +
-					"check gossip to determine cluster state and intervene manually if needed",
-			)
-			if c.rollback.ToActive.ResolvedCmd != "" {
-				c.logger.Errorf("if this node needs to revert to active: %s", c.rollback.ToActive.ResolvedCmd)
-			}
-		}
-		return
-	}
-
-	// Check for explicit rollback signal from server
-	if c.failoverStream.GetRollbackRequired() {
-		c.logger.Error("server signalled rollback required — failover failed on the passive node")
-		if c.rollback.Enabled && wentPassive {
-			c.logger.Warn("rollback enabled: reverting this node to active")
-			if rbErr := RunRollbackToActive(c.rollback, c.getHookEnvMap(hookEnvMapParams{
-				isDryRunFailover: c.failoverStream.GetIsDryRunFailover(),
-				isPostFailover:   true,
-			}), c.failoverStream.GetIsDryRunFailover(), c.logger); rbErr != nil {
-				c.logger.Error("rollback to active failed — manual intervention required", "err", rbErr)
-				if c.rollback.ToActive.ResolvedCmd != "" {
-					c.logger.Errorf("to recover this node: %s", c.rollback.ToActive.ResolvedCmd)
-				}
-			}
-		} else {
-			c.logger.Error("rollback disabled — this node is currently passive; manual intervention required")
-			if c.rollback.ToActive.ResolvedCmd != "" {
-				c.logger.Errorf("to revert this node to active: %s", c.rollback.ToActive.ResolvedCmd)
-			}
-		}
-		return
-	}
-
-	if !c.failoverStream.GetIsSuccessfullyCompleted() {
-		c.logger.Errorf("server failed to complete failover: %s", c.failoverStream.GetErrorMessage())
-		return
-	}
-
-	c.logger.Info("failover complete")
-
-	// run post hooks now this is passive and active node says all is peachy
-	c.hooks.RunPostWhenPassive(c.getHookEnvMap(hookEnvMapParams{
-		isDryRunFailover: c.failoverStream.GetIsDryRunFailover(),
-		isPostFailover:   true,
-	}))
 }
 
 // waitUntilStartOfNextSlot waits until the start of the next slot
@@ -334,7 +174,7 @@ func (c *Client) waitUntilStartOfNextSlot() (newSlot uint64, err error) {
 	// ~5ms average detection lag vs ~25ms at the previous 50ms interval.
 	// On RPC error use a longer back-off to avoid hammering a struggling local node.
 	const (
-		pollInterval      = 10 * time.Millisecond
+		pollInterval       = 10 * time.Millisecond
 		errorRetryInterval = 50 * time.Millisecond
 	)
 	for {
@@ -387,6 +227,9 @@ func (c *Client) waitMinTimeToLeaderSlot() (err error) {
 		stringMinTimeToLeaderSlot := c.minTimeToLeaderSlot.Round(time.Second).String()
 
 		for {
+			if err := c.ctx.Err(); err != nil {
+				return err
+			}
 			onSchedule, timeToNextLeaderSlot, err := c.solanaRPCClient.GetTimeToNextLeaderSlotForPubkey(pubkey)
 			if err != nil {
 				if remainingRetries == 0 {
@@ -483,46 +326,32 @@ func (c *Client) getHookEnvMap(params hookEnvMapParams) (envMap map[string]strin
 // This allows the client to start independet of the server being ready to accept connections and latches
 // onto the server as soon as it is ready
 func (c *Client) connectToServer() error {
-	sp := spinner.New().Title(style.RenderPinkString("waiting for ") +
-		style.RenderPassiveString(c.serverName, false) +
-		style.RenderPinkString(" at ") +
-		style.RenderGreyString(c.serverAddress, false) +
-		style.RenderPinkString("..."))
-	sp.ActionWithErr(func(spinnerCtx context.Context) error {
-		ticker := time.NewTicker(500 * time.Millisecond)
-		defer ticker.Stop()
-
-		// Check immediately first, but give spinner a moment to render
+	ctx, cancel := context.WithTimeout(c.ctx, 2*time.Minute)
+	defer cancel()
+	var lastErr error
+	for {
+		if err := c.tryQUICConnectionContext(ctx); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			if isALPNMismatch(err) {
+				return fmt.Errorf("incompatible peer protocol: %w", err)
+			}
+		}
 		select {
-		case <-spinnerCtx.Done():
-			return spinnerCtx.Err()
-		case <-time.After(100 * time.Millisecond):
-			// Small delay to let spinner render
-			if err := c.tryQUICConnection(); err == nil {
-				return nil
-			}
+		case <-ctx.Done():
+			return fmt.Errorf("peer connection deadline: %w (last error: %v)", ctx.Err(), lastErr)
+		case <-time.After(500 * time.Millisecond):
 		}
-
-		for {
-			select {
-			case <-spinnerCtx.Done():
-				return spinnerCtx.Err()
-			case <-ticker.C:
-				// Try the actual QUIC connection
-				if err := c.tryQUICConnection(); err == nil {
-					return nil
-				}
-				// Server not ready yet, continue waiting
-			}
-		}
-	})
-	return sp.Run()
+	}
 }
 
 // tryQUICConnection attempts the actual QUIC connection that will be used.
 // It uses a basicPacketConn wrapper to avoid quic-go's OOB (recvmsg/sendmsg)
 // optimizations that fail on virtual network interfaces like Tailscale/WireGuard.
-func (c *Client) tryQUICConnection() error {
+func (c *Client) tryQUICConnection() error { return c.tryQUICConnectionContext(c.ctx) }
+
+func (c *Client) tryQUICConnectionContext(ctx context.Context) error {
 	udpAddr, err := net.ResolveUDPAddr("udp4", c.serverAddress)
 	if err != nil {
 		c.logger.Debug("failed to resolve server address", "err", err, "address", c.serverAddress)
@@ -545,16 +374,12 @@ func (c *Client) tryQUICConnection() error {
 		}
 	}
 
-	conn, err := tr.Dial(c.ctx, udpAddr, quicTLSConfig, nil)
+	attempt, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	conn, err := tr.Dial(attempt, udpAddr, quicTLSConfig, nil)
 	if err != nil {
 		tr.Close()
-		if isALPNMismatch(err) {
-			// Fatal logs and calls os.Exit(1) — the spinner will not retry.
-			c.logger.Fatal(
-				"passive node rejected connection: incompatible wire protocol version — " +
-					"ensure both nodes run the same version of solana-validator-failover",
-			)
-		}
+
 		c.logger.Debug("QUIC server not ready, retrying...", "err", err, "address", c.serverAddress)
 		return err
 	}
@@ -573,5 +398,6 @@ func (c *Client) tryQUICConnection() error {
 	}
 
 	c.Conn = conn
+	c.transport = tr
 	return nil
 }

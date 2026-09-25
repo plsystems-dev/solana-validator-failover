@@ -100,6 +100,9 @@ func (s *SolanaValidatorFailover) LoadFromConfigFile(configPath string) (err err
 	v.SetDefault("log.level", DefaultLogLevel)
 	v.SetDefault("log.format", DefaultLogFormat)
 	v.SetDefault("validator.bin", DefaultBin)
+	v.SetDefault("validator.client", "agave")
+	v.SetDefault("validator.failover.max_slot_lag", 32)
+	v.SetDefault("validator.failover.rollback.enabled", false)
 	v.SetDefault("validator.average_slot_duration", DefaultAverageSlotDuration)
 	v.SetDefault("validator.cluster", DefaultCluster)
 	v.SetDefault("validator.failover.min_time_to_leader_slot", DefaultFailoverMinimumTimeToLeaderSlot)
@@ -118,6 +121,11 @@ func (s *SolanaValidatorFailover) LoadFromConfigFile(configPath string) (err err
 	err = v.ReadInConfig()
 	if err != nil {
 		return
+	}
+	if v.GetString("validator.client") == "firedancer" {
+		v.SetDefault("validator.bin", "firedancer")
+		v.SetDefault("validator.failover.set_identity_active_cmd_template", "{{ .Bin }} set-identity --config {{ .FiredancerConfig }} {{ .Identities.Active.KeyFile }}")
+		v.SetDefault("validator.failover.set_identity_passive_cmd_template", "{{ .Bin }} set-identity --config {{ .FiredancerConfig }} {{ .Identities.Passive.KeyFile }}")
 	}
 
 	// Unmarshal into the full config structure

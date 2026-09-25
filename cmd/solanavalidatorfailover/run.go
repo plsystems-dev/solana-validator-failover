@@ -1,7 +1,8 @@
 package solanavalidatorfailover
 
 import (
-	"github.com/charmbracelet/log"
+	"fmt"
+
 	"github.com/sol-strategies/solana-validator-failover/internal/validator"
 	"github.com/spf13/cobra"
 )
@@ -19,14 +20,14 @@ var (
 		Use:          "run",
 		Short:        "run a failover - automatically detects what to do based on the node's role (active or passive)",
 		SilenceUsage: true,
-		Run: func(cmd *cobra.Command, args []string) {
+		RunE: func(cmd *cobra.Command, args []string) error {
 			if loadedConfig == nil {
-				log.Fatal("config was not loaded before running command")
+				return fmt.Errorf("config was not loaded before running command")
 			}
 
 			v, err := validator.NewFromConfig(&loadedConfig.Validator)
 			if err != nil {
-				log.Fatal("failed to create validator", "err", err)
+				return fmt.Errorf("failed to create validator: %w", err)
 			}
 
 			err = v.Failover(validator.FailoverParams{
@@ -39,8 +40,9 @@ var (
 				ToPeer:                toPeer,
 			})
 			if err != nil {
-				log.Fatal("failed to failover", "err", err)
+				return fmt.Errorf("failed to failover: %w", err)
 			}
+			return nil
 		},
 	}
 )
@@ -49,9 +51,9 @@ func init() {
 	runCmd.Flags().BoolVar(&notADrill, "not-a-drill", false, "execute failover for real (not a drill)")
 	runCmd.Flags().BoolVar(&noWaitForHealthy, "no-wait-for-healthy", false, "don't wait for node to report being healthy by calling <config.validator.rpc_address>/health")
 	runCmd.Flags().BoolVar(&noMinTimeToLeaderSlot, "no-min-time-to-leader-slot", false, "when run on an active node, don't wait until it has no leader slots in the next <config.validator.min_time_to_leader_slot> (default: 5m) - ignored when run on a passive node")
-	runCmd.Flags().BoolVar(&skipTowerSync, "skip-tower-sync", false, "skip syncing the tower file from active to passive node (passive node must not have a tower file)")
+	runCmd.Flags().BoolVar(&skipTowerSync, "skip-tower-sync", false, "deprecated: native handovers negotiate the slot guard automatically; rejected for Agave-only pairs")
 	runCmd.Flags().BoolVarP(&autoConfirm, "yes", "y", false, "automatically answer yes to all prompts")
-	runCmd.Flags().BoolVarP(&rollbackEnabled, "rollback-enabled", "r", false, "force-enable rollback regardless of the rollback.enabled config value")
+	runCmd.Flags().BoolVarP(&rollbackEnabled, "rollback-enabled", "r", false, "deprecated: automatic rollback is rejected by the fenced protocol")
 	runCmd.Flags().StringVar(&toPeer, "to-peer", "", "when run on an active node, auto-select a peer by name or IP address (skips interactive prompt)")
 	rootCmd.AddCommand(runCmd)
 }

@@ -10,6 +10,8 @@ import (
 
 // NodeInfo represents the information about a node that is needed to perform a failover
 type NodeInfo struct {
+	Client                         string
+	VoteAccount                    string
 	PublicIP                       string
 	Hostname                       string
 	Identities                     *identities.Identities

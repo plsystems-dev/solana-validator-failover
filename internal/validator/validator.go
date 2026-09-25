@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/huh/spinner"
 	"github.com/charmbracelet/log"
+	solanago "github.com/gagliardetto/solana-go"
 	"github.com/sol-strategies/solana-validator-failover/internal/constants"
 	"github.com/sol-strategies/solana-validator-failover/internal/failover"
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
@@ -54,6 +55,14 @@ type BinMetadata struct {
 
 // Validator is a validator that uses the new QUIC protocol
 type Validator struct {
+	VoteAccount string
+
+	Client           string
+	FiredancerConfig string
+	ClusterRPCURL    string
+	MaxSlotLag       uint64
+	LiveIdentity     string
+
 	Bin                            string
 	BinMetadata                    BinMetadata
 	FailoverServerConfig           ServerConfig
@@ -98,6 +107,36 @@ func NewFromConfig(cfg *Config) (*Validator, error) {
 
 // NewFromConfig initializes the validator from a config
 func (v *Validator) NewFromConfig(cfg *Config) error {
+	v.VoteAccount = cfg.VoteAccount
+	if v.VoteAccount != "" {
+		if _, err := solanago.PublicKeyFromBase58(v.VoteAccount); err != nil {
+			return fmt.Errorf("validator.vote_account: %w", err)
+		}
+	}
+	v.Client = cfg.Client
+	if v.Client == "" {
+		v.Client = "agave"
+	}
+	if v.Client != "agave" && v.Client != "firedancer" {
+		return fmt.Errorf("unsupported validator.client %q", v.Client)
+	}
+	v.MaxSlotLag = cfg.Failover.MaxSlotLag
+	if v.MaxSlotLag == 0 {
+		v.MaxSlotLag = failover.DefaultMaxSlotLag
+	}
+	if v.Client == "firedancer" {
+		if v.VoteAccount == "" {
+			return fmt.Errorf("firedancer requires validator.vote_account")
+		}
+		path, err := utils.ResolvePath(cfg.FiredancerConfig)
+		if err != nil {
+			return fmt.Errorf("firedancer_config: %w", err)
+		}
+		if info, err := os.Stat(path); err != nil || !info.Mode().IsRegular() {
+			return fmt.Errorf("firedancer_config must be a readable regular file: %s", path)
+		}
+		v.FiredancerConfig = path
+	}
 
 	log.Debug("================================================")
 	v.logger.Debug("configuring...")
@@ -117,9 +156,11 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 	}
 
 	// ledger dir must be valid and exist
-	err = v.configureLedgerDir(cfg.LedgerDir)
-	if err != nil {
-		return err
+	if v.Client != "firedancer" {
+		err = v.configureLedgerDir(cfg.LedgerDir)
+		if err != nil {
+			return err
+		}
 	}
 
 	// configure identities
@@ -129,9 +170,11 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 	}
 
 	// tower file configure
-	err = v.configureTowerFile(cfg.Tower)
-	if err != nil {
-		return err
+	if v.Client != "firedancer" {
+		err = v.configureTowerFile(cfg.Tower)
+		if err != nil {
+			return err
+		}
 	}
 
 	// set identity commands configure
@@ -199,11 +242,17 @@ func (v *Validator) NewFromConfig(cfg *Config) error {
 
 // IsActive returns true if the validator is active
 func (v *Validator) IsActive() bool {
+	if v.LiveIdentity != "" {
+		return v.LiveIdentity == v.Identities.Active.PubKey()
+	}
 	return v.GossipNode.PubKey() == v.Identities.Active.PubKey()
 }
 
 // IsPassive returns true if the validator is passive
 func (v *Validator) IsPassive() bool {
+	if v.LiveIdentity != "" {
+		return v.LiveIdentity == v.Identities.Passive.PubKey()
+	}
 	return v.GossipNode.PubKey() == v.Identities.Passive.PubKey()
 }
 
@@ -213,6 +262,14 @@ func (v *Validator) Failover(params FailoverParams) (err error) {
 	defer log.Debug("run failover done")
 
 	log.Debugf("failover with params: %+v", params)
+	status, err := failover.NewSafetyReader(v.RPCAddress, v.ClusterRPCURL).Snapshot(context.Background())
+	if err != nil {
+		return fmt.Errorf("live role lookup: %w", err)
+	}
+	v.LiveIdentity = status.Identity
+	if !v.IsActive() && !v.IsPassive() {
+		return fmt.Errorf("live identity is outside this pair: %s", v.LiveIdentity)
+	}
 
 	// wait until healthy unless told otherwise
 	if params.NoWaitForHealthy {
@@ -281,6 +338,10 @@ func (v *Validator) configureRPCClient(localRPCURL, solanaClusterName, clusterRP
 	)
 
 	v.RPCAddress = localRPCURL
+	v.ClusterRPCURL = solanaClusterRPCURL
+	if localRPCURL == solanaClusterRPCURL {
+		return fmt.Errorf("cluster_rpc_url must be independent of local rpc_address")
+	}
 	v.solanaRPCClient = v.NewSolanaRPCClient(solana.NewClientParams{
 		LocalRPCURL:         localRPCURL,
 		ClusterRPCURL:       solanaClusterRPCURL,
@@ -746,43 +807,16 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 		)
 	}
 
-	// delete the tower file if it exists and auto empty when passive is true
-	if v.TowerFileAutoDeleteWhenPassive && utils.FileExists(v.TowerFile) {
-		log.Debug("deleting tower file because validator.tower.auto_empty_when_passive is true",
-			"tower_file", v.TowerFile,
-		)
-
-		if err = utils.RemoveFile(v.TowerFile); err != nil {
-			return err
-		}
-	}
-
-	// if the tower file exists and auto empty when passive is false, confirm if you want it deleted and exit if not.
-	if !v.TowerFileAutoDeleteWhenPassive && utils.FileExists(v.TowerFile) {
-		log.Warn("tower file exists", "tower_file", v.TowerFile)
-		if params.AutoConfirm {
-			log.Warn("--yes flag set, automatically deleting tower file", "tower_file", v.TowerFile)
-		} else {
-			confirmed, err := confirm("Delete tower file and proceed?")
-			if err != nil {
-				return err
-			}
-			if !confirmed {
-				return fmt.Errorf("cancelled")
-			}
-		}
-		// delete the tower file
-		if err = utils.RemoveFile(v.TowerFile); err != nil {
-			return err
-		}
-	}
-
 	// create a QUIC server that listens for the active node to connect and decide what to do
 	failoverServer, err := failover.NewServerFromConfig(failover.ServerConfig{
+		Safety:            failover.NewSafetyReader(v.RPCAddress, v.ClusterRPCURL),
+		MaxSlotLag:        v.MaxSlotLag,
 		Port:              v.FailoverServerConfig.Port,
 		HeartbeatInterval: v.FailoverServerConfig.HeartbeatInterval,
 		StreamTimeout:     v.FailoverServerConfig.StreamTimeout,
 		PassiveNodeInfo: &failover.NodeInfo{
+			Client:                         v.Client,
+			VoteAccount:                    v.VoteAccount,
 			Hostname:                       v.Hostname,
 			PublicIP:                       v.PublicIP,
 			Identities:                     v.Identities,
@@ -813,9 +847,7 @@ func (v *Validator) makeActive(params FailoverParams) (err error) {
 		return err
 	}
 
-	failoverServer.Start()
-
-	return nil
+	return failoverServer.Start()
 }
 
 // makePassive makes this validator passive
@@ -832,15 +864,6 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 
 	log.Debug("failover active to passive")
 
-	// ensure tower file exists and is not empty
-	if !utils.FileExists(v.TowerFile) {
-		return fmt.Errorf("tower file does not exist: %s", v.TowerFile)
-	}
-
-	if utils.FileSize(v.TowerFile) == 0 {
-		return fmt.Errorf("tower file is empty: %s", v.TowerFile)
-	}
-
 	// select passive peer to connect to from declared peers
 	selectedPassivePeer, err := v.selectPassivePeer(params)
 	if err != nil {
@@ -849,6 +872,8 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 
 	// connect to the passive peer and follow its lead to handover as active
 	failoverClient, err := failover.NewClientFromConfig(failover.ClientConfig{
+		Safety:                         failover.NewSafetyReader(v.RPCAddress, v.ClusterRPCURL),
+		MaxSlotLag:                     v.MaxSlotLag,
 		ServerName:                     selectedPassivePeer.Name,
 		ServerAddress:                  selectedPassivePeer.Address,
 		MinTimeToLeaderSlot:            params.MinTimeToLeaderSlot,
@@ -857,11 +882,13 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 		RPCURL:                         v.RPCAddress,
 		SkipTowerSync:                  params.SkipTowerSync,
 		ActiveNodeInfo: &failover.NodeInfo{
-			Hostname:                       v.Hostname,
-			PublicIP:                       v.PublicIP,
-			Identities:                     v.Identities,
-			TowerFile:                      v.TowerFile,
-			TowerFileSizeBytes:             utils.FileSize(v.TowerFile),
+			Client:      v.Client,
+			VoteAccount: v.VoteAccount,
+			Hostname:    v.Hostname,
+			PublicIP:    v.PublicIP,
+			Identities:  v.Identities,
+			TowerFile:   v.TowerFile,
+
 			SetIdentityCommand:             v.SetIdentityPassiveCommand,
 			ClientVersion:                  v.GossipNode.Version(),
 			ClientVersionRPC:               v.getLocalNodeVersion(),
@@ -876,9 +903,7 @@ func (v *Validator) makePassive(params FailoverParams) (err error) {
 		return fmt.Errorf("failed to connect to peer %s: %w", selectedPassivePeer.Name, err)
 	}
 
-	failoverClient.Start()
-
-	return nil
+	return failoverClient.Start()
 }
 
 // waitUntilHealthy waits until the validator is healthy and synced

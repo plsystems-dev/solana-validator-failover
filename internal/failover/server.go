@@ -5,8 +5,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/charmbracelet/huh/spinner"
@@ -17,7 +15,6 @@ import (
 	"github.com/sol-strategies/solana-validator-failover/internal/solana"
 	"github.com/sol-strategies/solana-validator-failover/internal/style"
 	"github.com/sol-strategies/solana-validator-failover/internal/utils"
-	pkgconstants "github.com/sol-strategies/solana-validator-failover/pkg/constants"
 )
 
 // MonitorConfig holds the configuration for a failover monitor
@@ -34,6 +31,8 @@ type CreditSamplesConfig struct {
 
 // ServerConfig is the configuration for the failover server
 type ServerConfig struct {
+	Safety            safetyReader
+	MaxSlotLag        uint64
 	Port              int
 	HeartbeatInterval string
 	StreamTimeout     string
@@ -54,6 +53,12 @@ type ServerConfig struct {
 
 // Server is the failover server - run by the passive node
 type Server struct {
+	safety            safetyReader
+	maxSlotLag        uint64
+	runCommand        func(context.Context, string, bool) error
+	pollInterval      time.Duration
+	voteTimeout       time.Duration
+	votePollInterval  time.Duration
 	port              int
 	listenAddr        string
 	tlsConfig         *tls.Config
@@ -97,9 +102,15 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), transactionTimeout)
 
 	s := &Server{
+		safety:           config.Safety,
+		maxSlotLag:       config.MaxSlotLag,
+		runCommand:       runIdentityCommand,
+		pollInterval:     guardPollInterval,
+		voteTimeout:      time.Minute,
+		votePollInterval: 2 * time.Second,
 		port:             config.Port,
 		tlsConfig:        serverTLSConfig,
 		mtlsEnabled:      mtlsEnabled,
@@ -115,6 +126,9 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 		skipTowerSync:    config.SkipTowerSync,
 		autoConfirm:      config.AutoConfirm,
 		rollback:         config.Rollback,
+	}
+	if s.maxSlotLag == 0 {
+		s.maxSlotLag = DefaultMaxSlotLag
 	}
 
 	if s.port == 0 {
@@ -145,469 +159,60 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 }
 
 // Start starts the failover server
-func (s *Server) Start() error {
+func (s *Server) Start() (err error) {
+	defer s.cancel()
 	wrapped, err := newBasicPacketConn(fmt.Sprintf(":%d", s.port))
 	if err != nil {
-		return fmt.Errorf("failed to create UDP socket: %v", err)
+		return fmt.Errorf("create UDP socket: %w", err)
 	}
 	s.transport = &quic.Transport{Conn: wrapped}
-
-	listener, err := s.transport.Listen(
-		s.tlsConfig,
-		&quic.Config{
-			KeepAlivePeriod: s.heartbeatInterval,
-			MaxIdleTimeout:  s.streamTimeout,
-		},
-	)
-	if err != nil {
-		wrapped.Close()
-		return fmt.Errorf("failed to create listener: %v", err)
-	}
-	s.listener = listener
-
-	s.logger.Info(style.RenderPinkString(fmt.Sprintf("listening on port %d - run this program on the ", s.port)) +
-		style.RenderActiveString("active", false) +
-		style.RenderPinkString(" validator to continue"))
-
-	for {
-		select {
-		case <-s.ctx.Done():
-			return nil
-		default:
-			conn, err := s.listener.Accept(context.Background())
-			if err != nil {
-				if err.Error() == "quic: server closed" {
-					return nil
-				}
-				s.logger.Error("failed to accept connection", "err", err)
-				continue
-			}
-
-			go s.handleConnection(conn)
-		}
-	}
-}
-
-// handleConnection handles a new failover connection
-func (s *Server) handleConnection(conn *quic.Conn) {
-	defer conn.CloseWithError(0, "connection closed")
-
-	s.logger.Debug("accepted new connection", "remote_addr", conn.RemoteAddr().String())
-
-	if s.mtlsEnabled {
-		tlsState := conn.ConnectionState().TLS
-		if len(tlsState.PeerCertificates) > 0 {
-			peer := tlsState.PeerCertificates[0]
-			s.logger.Info("mTLS: client certificate verified",
-				"remote_addr", conn.RemoteAddr().String(),
-				"subject", peer.Subject.String(),
-				"issuer", peer.Issuer.String(),
-				"expires", peer.NotAfter,
-			)
-		}
-	}
-
-	s.activeConn = conn
-
-	// Accept streams
-	for {
-		stream, err := conn.AcceptStream(s.ctx)
-		if err != nil {
-			s.logger.Debug("failed to accept stream", "remote_addr", conn.RemoteAddr().String(), "err", err)
-			return
-		}
-
-		s.logger.Debug("accepted new stream", "remote_addr", conn.RemoteAddr().String())
-		go s.handleStream(stream)
-	}
-}
-
-// handleStream handles a new failover stream
-func (s *Server) handleStream(stream *quic.Stream) {
-	defer stream.Close()
-
-	// Read the message type
-	msgType := make([]byte, 1)
-	if _, err := io.ReadFull(stream, msgType); err != nil {
-		if err == io.EOF {
-			s.logger.Debug("stream closed by peer")
-			return
-		}
-		s.logger.Debugf("failed to read message type: %v", err)
-		return
-	}
-
-	// Check wire protocol version before any gob work.
-	// This gives a clear error when nodes are running incompatible versions,
-	// rather than the cryptic gob type-mismatch that would otherwise surface.
-	if err := readAndCheckWireVersion(stream); err != nil {
-		s.logger.Fatal("aborting", "err", err)
-		return
-	}
-
-	switch msgType[0] {
-	case MessageTypeFailoverInitiateRequest: // failover
-		s.logger.Debug("received failover initiate request")
-		s.handleFailoverStream(stream)
-	default:
-		s.logger.Errorf("unknown message type: %d - ignoring stream", msgType[0])
-	}
-}
-
-func (s *Server) handleFailoverStream(stream *quic.Stream) {
-	// read the message and parse it into a Stream struct
-	s.failoverStream = NewFailoverStream(stream)
-	if s.failoverStream.Decode() != nil {
-		return
-	}
-
-	// Write our wire protocol version in the server→client direction before
-	// any gob encode so the client can verify compatibility symmetrically.
-	if err := writeWireVersion(stream); err != nil {
-		s.logger.Error("failed to write wire version to client", "err", err)
-		return
-	}
-
-	// set the is dry run failover flag
-	s.failoverStream.SetIsDryRunFailover(s.isDryRunFailover)
-
-	// set the skip tower sync flag
-	s.failoverStream.SetSkipTowerSync(s.skipTowerSync)
-
-	// set this node's info so subsequent responses can be sent to the client with it
-	s.failoverStream.SetPassiveNodeInfo(s.passiveNodeInfo)
-
-	// ensure client and this server are using the same version of solana-validator-failover
-	clientVersion := s.failoverStream.GetActiveNodeInfo().SolanaValidatorFailoverVersion
-	serverVersion := pkgconstants.AppVersion
-
-	s.logger.Debug("checking for client and server version mismatch",
-		"server_version", serverVersion,
-		"client_version", clientVersion,
-	)
-
-	if clientVersion != serverVersion {
-		s.failoverStream.LogErrorWithSetMessagef("Server (%s) and client (%s) version mismatch", serverVersion, clientVersion)
-		if err := s.failoverStream.Encode(); err != nil {
-			s.logger.Error("failed to send error message to client", "err", err)
-		}
-		s.logger.Fatal("server and client running different versions of this program - aborting")
-		return
-	}
-
-	// Query gossip for the client by both its public IP and configured active identity.
-	activeNodeInfo := s.failoverStream.GetActiveNodeInfo()
-	expectedActivePubkey := activeNodeInfo.Identities.Active.PubKey()
-	s.logger.Debug("querying gossip for active node",
-		"public_ip", activeNodeInfo.PublicIP,
-		"pubkey", expectedActivePubkey,
-	)
-	gossipActiveNode, err := s.solanaRPCClient.NodeFromIPWithExpectedPubkey(activeNodeInfo.PublicIP, expectedActivePubkey)
-	if err != nil {
-		s.failoverStream.LogErrorWithSetMessagef("Failed to validate active node: %v", err)
-		if s.failoverStream.Encode() != nil {
-			return
-		}
-		return
-	}
-
-	// Ensure the failover request comes from the configured active node.
-	if err := validateActiveGossipIdentity(gossipActiveNode.IP(), gossipActiveNode.PubKey(), activeNodeInfo.PublicIP, expectedActivePubkey); err != nil {
-		s.failoverStream.LogErrorWithSetMessagef("Failed to validate active node: %v", err)
-		if s.failoverStream.Encode() != nil {
-			return
-		}
-		return
-	}
-
-	// confirm the failover with the user
-	// Get RPC URLs from the messages passed between client and server
-	activeRPCURL := s.failoverStream.GetActiveNodeInfo().RPCAddress
-	passiveRPCURL := s.failoverStream.GetPassiveNodeInfo().RPCAddress
-
-	// Abort if rollback is enabled on one side but not the other.
-	// Partial rollback is worse than no rollback — one node reverts while the other stays passive.
-	clientRollback := s.failoverStream.GetActiveRollbackEnabled()
-	serverRollback := s.rollback.Enabled
-	if serverRollback != clientRollback {
-		var msg string
-		if serverRollback {
-			msg = "rollback mismatch: this node has rollback.enabled=true but the active node does not"
-		} else {
-			msg = "rollback mismatch: the active node has rollback.enabled=true but this node does not"
-		}
-		msg += " — both nodes must have rollback identically configured; fix the config and retry"
-		s.failoverStream.SetErrorMessage(msg)
-		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-			s.logger.Error("failed to send error message to client", "err", encodeErr)
-		}
-		s.logger.Fatal(msg)
-		return
-	}
-
-	s.logger.Infof("%s connected from %s - failover plan:", s.failoverStream.GetActiveNodeInfo().Hostname, s.activeConn.RemoteAddr())
-
-	if err := s.failoverStream.ConfirmFailover(s.hooks, s.rollback, activeRPCURL, passiveRPCURL, s.autoConfirm); err != nil {
-		s.logger.Error("failover cancelled", "err", err)
-
-		// Send error message to client before exiting
-		s.failoverStream.SetErrorMessagef("server cancelled failover: %v", err)
-		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-			s.logger.Error("failed to send error message to client", "err", encodeErr)
-		}
-
-		// close the server listener and cancel the context to stop accepting new connections
-		if s.listener != nil {
-			if err := s.listener.Close(); err != nil {
-				s.logger.Error("failed to close listener", "err", err)
-			}
-		}
-		if s.transport != nil {
-			if err := s.transport.Close(); err != nil {
-				s.logger.Error("failed to close transport", "err", err)
-			}
-		}
-		s.cancel()
-		os.Exit(1)
-	}
-
-	// take initial sample of vote credits and rank for the active key - use it to compare later
-	s.logger.Debug("pulling pre-failover vote credits sample...")
-	err = s.failoverStream.PullActiveIdentityVoteCreditsSample(s.solanaRPCClient)
-	if err != nil {
-		s.logger.Error("failed to pull active identity vote credits sample", "err", err)
-		s.failoverStream.SetErrorMessagef("server failed to pull active identity vote credits sample: %v", err)
-		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-			s.logger.Error("failed to send error message to client", "err", encodeErr)
-		}
-		return
-	}
-
-	// this is where the actual failover starts
-
-	var towerFile *os.File
-	// if skip tower sync is enabled, remove tower file if it exists
-	if s.skipTowerSync {
-		if utils.FileExists(s.failoverStream.GetPassiveNodeInfo().TowerFile) {
-			s.logger.Infof("removing existing tower file at %s", s.failoverStream.GetPassiveNodeInfo().TowerFile)
-			if err := utils.RemoveFile(s.failoverStream.GetPassiveNodeInfo().TowerFile); err != nil {
-				s.failoverStream.SetErrorMessagef("failed to remove tower file at %s: %v", s.failoverStream.GetPassiveNodeInfo().TowerFile, err)
-				if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-					s.logger.Error("failed to send error message to client", "err", encodeErr)
-				}
-				s.logger.Fatal(fmt.Sprintf("failed to remove tower file at %s", s.failoverStream.GetPassiveNodeInfo().TowerFile), "err", err)
-				return
-			}
-		}
-	} else {
-		// Open tower file handle early to speed up failover
-		var err error
-		towerFile, err = os.OpenFile(
-			s.failoverStream.GetPassiveNodeInfo().TowerFile,
-			os.O_WRONLY|os.O_CREATE|os.O_TRUNC,
-			os.FileMode(0644), // User and group can read/write, others can read
-		)
-		if err != nil {
-			s.logger.Error(fmt.Sprintf("failed to open tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile), "err", err)
-			s.failoverStream.SetErrorMessagef("server failed to open its tower file %s: %v", s.failoverStream.GetPassiveNodeInfo().TowerFile, err)
-			if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-				s.logger.Error("failed to send error message to client", "err", encodeErr)
-			}
-			return
-		}
-		defer utils.SafeCloseFile(towerFile)
-	}
-
-	// run pre hooks when passive
-	err = s.hooks.RunPreWhenPassive(s.getHookEnvMap(hookEnvMapParams{
-		isDryRunFailover: s.isDryRunFailover,
-		isPreFailover:    true,
-	}))
-	if err != nil {
-		s.failoverStream.SetErrorMessagef("server failed to run its pre-failover hooks: %v", err)
-		if encodeErr := s.failoverStream.Encode(); encodeErr != nil {
-			s.logger.Error("failed to send error message to client", "err", encodeErr)
-		}
-		s.logger.Fatal("failed to run pre hooks when passive", "err", err)
-		return
-	}
-
-	// set can proceed to true
-	s.failoverStream.SetCanProceed(true)
-	if s.failoverStream.Encode() != nil {
-		return
-	}
-
-	if s.skipTowerSync {
-		s.logger.Info("failover started - skipping tower file sync")
-	} else {
-		s.logger.Infof("failover started - waiting for tower file from %s", s.failoverStream.GetActiveNodeInfo().Hostname)
-
-		// Wait for the updated node info with tower file bytes
-		if err := s.failoverStream.Decode(); err != nil {
-			s.logger.Error("failed to decode updated node info", "err", err)
-			return
-		}
-
-		// check that the TowerFileBytes sent are the same as the hash of the tower file
-		computedTowerFileHash := s.failoverStream.GetActiveNodeInfo().ComputeTowerFileHashFromBytes(s.failoverStream.GetActiveNodeInfo().TowerFileBytes)
-		expectedTowerFileHash := s.failoverStream.GetActiveNodeInfo().TowerFileHash
-
-		s.logger.Debugf("checking tower file hash - received: %s expected: %s", computedTowerFileHash, expectedTowerFileHash)
-
-		if computedTowerFileHash != expectedTowerFileHash {
-			s.logger.Errorf("tower file hash mismatch: (got: %s) != (expected: %s)", computedTowerFileHash, expectedTowerFileHash)
-			s.logger.Error("aborting failover - save it by running:")
-			fmt.Printf(
-				"  rsync -avz --no-perms --no-i-r --no-progress --no-motd --no-times -e ssh -i <YOUR-SSH-KEY> -o PubkeyAcceptedKeyTypes=+ssh-ed25519 -o HostKeyAlgorithms=+ssh-ed25519 -o BatchMode=yes -o StrictHostKeyChecking=no %s@%s:%s %s \n",
-				os.Getenv("USER"),
-				s.failoverStream.GetActiveNodeInfo().Hostname,
-				s.failoverStream.GetActiveNodeInfo().TowerFile,
-				s.failoverStream.GetPassiveNodeInfo().TowerFile,
-			)
-			s.logger.Error("then run:")
-			fmt.Printf("  %s \n", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand)
-			s.logger.Fatal("tower file hash mismatch - failover aborted")
-			return
-		}
-
-		// Write bytes and close immediately
-		if _, err := towerFile.Write(s.failoverStream.GetActiveNodeInfo().TowerFileBytes); err != nil {
-			s.logger.Error(fmt.Sprintf("failed to write tower file to %s", s.failoverStream.GetPassiveNodeInfo().TowerFile), "err", err)
-			return
-		}
-
-		// close the file handle - defer utils.SafeCloseFile() above won't conflict
-		if err := towerFile.Close(); err != nil {
-			s.logger.Error(fmt.Sprintf("failed to close tower file %s", s.failoverStream.GetPassiveNodeInfo().TowerFile), "err", err)
-			return
-		}
-
-		s.failoverStream.SetPassiveNodeSyncTowerFileEndTime()
-		s.logger.Info("received tower file")
-	}
-
-	// set identity to active
-	dryRunPrefix := ""
-	if s.isDryRunFailover {
-		dryRunPrefix = style.RenderLightGreyString("(dry run)") + " "
-	}
-	s.logger.Info(dryRunPrefix +
-		style.RenderPinkString("changing to ") +
-		style.RenderActiveString(constants.NodeRoleActive, false) +
-		style.RenderPinkString(" identity"))
-
-	s.failoverStream.SetPassiveNodeSetIdentityStartTime()
-
-	err = utils.RunCommand(utils.RunCommandParams{
-		CommandSlice: strings.Split(s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand, " "),
-		DryRun:       s.isDryRunFailover,
-		LogDebug:     s.logger.GetLevel() <= log.DebugLevel,
+	defer s.transport.Close()
+	listener, err := s.transport.Listen(s.tlsConfig, &quic.Config{
+		KeepAlivePeriod: s.heartbeatInterval, MaxIdleTimeout: s.streamTimeout,
 	})
 	if err != nil {
-		s.logger.Error(fmt.Sprintf("failed to set identity to active with command: %s", s.failoverStream.GetPassiveNodeInfo().SetIdentityCommand), "err", err)
-		if s.rollback.Enabled {
-			// Both sides have rollback enabled (mismatch is caught earlier).
-			s.logger.Warn("rollback enabled: signalling active node to revert, then re-asserting passive identity")
-			s.failoverStream.SetRollbackRequired(true)
-			// best-effort — client may already be gone; ignore encode error
-			_ = s.failoverStream.Encode()
-			if rbErr := RunRollbackToPassive(s.rollback, s.getHookEnvMap(hookEnvMapParams{
-				isDryRunFailover: s.isDryRunFailover,
-				isPostFailover:   true,
-			}), s.isDryRunFailover, s.logger); rbErr != nil {
-				s.logger.Error("rollback to passive failed — manual intervention required", "err", rbErr)
-			}
-		} else {
-			s.logger.Error("rollback disabled — this node is still passive; the peer has also switched to passive")
-			if s.rollback.ToPassive.ResolvedCmd != "" {
-				s.logger.Errorf("to recover this node: %s", s.rollback.ToPassive.ResolvedCmd)
-			}
-		}
-		s.logger.Fatal("set identity to active failed — failover aborted", "err", err)
-		return
+		return fmt.Errorf("create listener: %w", err)
 	}
-
-	s.failoverStream.SetPassiveNodeSetIdentityEndTime()
-
-	// get the current slot and record it - sometimes rpc will be a slot behind, if so, assume same-slot
-	failoverEndSlot, err := s.solanaRPCClient.GetCurrentSlot()
+	s.listener = listener
+	defer listener.Close()
+	s.logger.Infof("listening on port %d for one authenticated handover", s.port)
+	// A participant handles one transaction. Shared protocol state is never
+	// accessed by concurrent connections or streams.
+	conn, err := listener.Accept(s.ctx)
 	if err != nil {
-		s.logger.Warn("failed to get current slot", "err", err)
-		err = nil
-	} else if failoverEndSlot < s.failoverStream.GetFailoverStartSlot() {
-		s.failoverStream.SetFailoverEndSlot(s.failoverStream.GetFailoverStartSlot())
-	} else {
-		s.failoverStream.SetFailoverEndSlot(failoverEndSlot)
+		return err
 	}
-
-	// set is successfully completed to true
-	s.failoverStream.SetIsSuccessfullyCompleted(true)
-	if s.failoverStream.Encode() != nil {
-		return
-	}
-
-	// run post hooks when active
-	s.hooks.RunPostWhenActive(s.getHookEnvMap(hookEnvMapParams{
-		isDryRunFailover: s.isDryRunFailover,
-		isPostFailover:   true,
-	}))
-
-	if !s.isDryRunFailover {
-		s.confirmGossipNodesPostFailover()
-	}
-
-	// build and render the post-failover summary immediately (before credit monitoring)
-	summaryData := s.failoverStream.BuildSummaryData()
-	rendered, renderErr := RenderFailoverSummary(summaryData)
-	if renderErr != nil {
-		s.logger.Error("failed to render failover summary", "err", renderErr)
-	} else {
-		s.logger.Info("post-failover state:")
-		fmt.Println(style.RenderMessageString(strings.TrimLeft(rendered, "\n")))
-	}
-
-	// monitor the credits by pulling configured samples
-	s.logger.Info("monitoring vote credits post-failover...")
-	err = s.failoverStream.PullActiveIdentityVoteCreditsSamples(s.solanaRPCClient, s.monitorConfig.CreditSamples.Count, s.monitorConfig.CreditSamples.IntervalDuration)
+	s.activeConn = conn
+	defer func() {
+		code := quic.ApplicationErrorCode(0)
+		if err != nil {
+			code = 1
+		}
+		_ = conn.CloseWithError(code, "participant finished")
+	}()
+	stream, err := conn.AcceptStream(s.ctx)
 	if err != nil {
-		s.logger.Error("failed to pull active identity vote credits samples", "err", err)
+		return err
 	}
-
-	rankDifference, firstRank, lastRank, rankErr := s.failoverStream.GetVoteCreditRankDifference()
-	if rankErr == nil {
-		var rankMsg string
-		switch {
-		case rankDifference > 0:
-			rankMsg = style.RenderActiveString(fmt.Sprintf("improved by +%d", rankDifference), false)
-		case rankDifference < 0:
-			rankMsg = style.RenderPassiveString(fmt.Sprintf("worsened by %d", rankDifference), false)
-		default:
-			rankMsg = style.RenderLightGreyString("unchanged")
-		}
-		s.logger.Infof("vote credits: rank %s (%d → %d)", rankMsg, firstRank, lastRank)
+	defer stream.Close()
+	if err := stream.SetReadDeadline(time.Now().Add(proofTimeout)); err != nil {
+		return err
 	}
-
-	// close the stream and connection cleanly
-	if err := stream.Close(); err != nil {
-		s.logger.Error("failed to close stream", "err", err)
+	var kind [1]byte
+	if _, err := io.ReadFull(stream, kind[:]); err != nil {
+		return err
 	}
-	if err := s.activeConn.CloseWithError(quic.ApplicationErrorCode(0), "failover complete"); err != nil {
-		s.logger.Debugf("closing connection after successful failover: %v", err)
+	if kind[0] != MessageTypeFailoverInitiateRequest {
+		return fmt.Errorf("unexpected stream type %d", kind[0])
 	}
-
-	// close the server listener and cancel the context to stop accepting new connections
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			s.logger.Error("failed to close listener", "err", err)
-		}
+	if err := readAndCheckWireVersion(stream); err != nil {
+		return err
 	}
-	if s.transport != nil {
-		if err := s.transport.Close(); err != nil {
-			s.logger.Error("failed to close transport", "err", err)
-		}
+	if err := writeWireVersion(stream); err != nil {
+		return err
 	}
-	s.cancel()
+	s.failoverStream = NewFailoverStream(stream)
+	return s.runDestination()
 }
 
 func validateActiveGossipIdentity(actualIP, actualPubkey, expectedIP, expectedPubkey string) error {

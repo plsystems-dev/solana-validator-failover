@@ -1,5 +1,82 @@
 # solana-validator-failover
 
+This PL Systems fork is `0.1.22-pl.1`, based on upstream `v0.1.22`, commit
+[`613764b50c1282a0274cde11c79ec3c3d593e433`](https://github.com/SOL-Strategies/solana-validator-failover/commit/613764b50c1282a0274cde11c79ec3c3d593e433).
+It supports Agave/Salsa and full Firedancer/Samba with wire protocol **3**.
+Both participants must run this protocol; older peers fail before identity changes.
+
+## Native and mixed-client handover
+
+Configure `validator.client` as `agave` (default) or `firedancer`. Native clients
+also require `validator.firedancer_config` and `validator.vote_account`. Configure
+the same vote-account public key on both participants in any native pair:
+
+```yaml
+validator:
+  client: firedancer
+  bin: /opt/harmonic-samba/v26.09.4-harmonic/bin/firedancer
+  firedancer_config: /etc/samba/validator.toml
+  vote_account: YOUR_VOTE_ACCOUNT_PUBLIC_KEY
+  cluster: mainnet-beta
+  cluster_rpc_url: https://api.mainnet-beta.solana.com
+  failover:
+    max_slot_lag: 32
+    rollback:
+      enabled: false
+    tls:
+      enabled: true
+      # Supply this node's existing CA/certificate/key paths below.
+```
+
+This is a partial profile; retain identities, local RPC, peers and TLS paths
+from the complete configuration below. Replace the illustrated vote account
+for your validator. Native identity-command defaults use `set-identity --config`
+and omit Agave's ledger/tower flags. Existing command templates remain supported.
+Do not override native commands with the Agave templates in the example below.
+Native ledger/tower paths are ignored and no dummy tower is required.
+
+Every transfer requires an explicit source-demoted acknowledgement. If either
+participant is native, both must use mTLS, advertise the same vote account, and
+wait until **both local and both independent finalized-slot views** reach a
+post-demotion processed-slot anchor plus **512 slots**. During that wait, the
+source answers fresh, sequenced identity/health/head challenges. The destination
+rechecks its identity, health and head; both genesis hashes and the epoch-effective
+vote authority are checked using the independent RPC. Authority is rechecked
+after the wait, immediately before promotion. Native mode requires the effective
+voter to equal the active identity, matching the identity-only signer profile.
+
+A compatible Agave-only pair still transfers a verified tower after demotion.
+For native pairs, no tower is transferred. An Agave destination archives its
+stale tower only after the guard passes and promotes without `--require-tower`.
+Native paths are never touched. The same procedure supports the reverse direction.
+The 512-slot interval is mandatory for the pinned native client; this automates
+the handover but cannot provide uninterrupted voting through it.
+
+**Service coordination is required.** The outer controller must hold each
+node's shared transition lock for the full transaction, quiesce the updater
+before HA, and keep a durable activation inhibit after any failed or ambiguous
+outcome. Every other activation path must honor that lock and inhibit. Fresh
+RPC proofs do not replace this protection against another local controller.
+Restore automation only after both participants exit successfully and their
+live identities are verified. This binary does not stop systemd services itself.
+
+Automatic rollback is rejected. A promotion error or lost connection exits
+nonzero and never reactivates the old signer. Inspect both live identities before
+recovery; when reversing a completed transfer, run a new handover with the roles
+reversed. Dry runs perform readiness/protocol checks but skip identity commands,
+all hooks and tower writes; they do not wait out the real 512-slot interval.
+
+Protocol completion verifies identities, health and head, then requires the
+configured vote account's independent `lastVote` to advance strictly beyond the
+guard target (or the post-demotion anchor for Agave-only pairs), with a 60-second
+deadline and repeated local checks. Stale votes cannot complete the transaction.
+The peer acknowledgement follows this verification; failure leaves automation
+inhibited and never reactivates the old signer. Legacy Agave configurations without
+`vote_account` explicitly report identity-only verification. Leader behavior
+remains a separate observation. The previous advisory credit-rank polling is
+replaced by this vote-progress check; its old configuration keys remain accepted.
+
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Simple p2p Solana validator failovers. This tool helps automate **planned** failovers. To automate **unexpected** failovers see [solana-validator-ha](https://github.com/SOL-Strategies/solana-validator-ha).
@@ -8,16 +85,16 @@ Simple p2p Solana validator failovers. This tool helps automate **planned** fail
 
 A QUIC-based program that orchestrates safe, fast failovers between Solana validators. [This post](https://solstrategies.io/blog/quic-solana-validator-failovers) covers the background in more detail. In summary, it coordinates three steps across both nodes:
 
-1. Active validator sets identity to passive
-2. Tower file synced from active to passive validator
-3. Passive validator sets identity to active
+1. Source switches passive and positively acknowledges demotion.
+2. Compatible Agave pairs transfer a tower; native pairs complete the guarded 512-slot wait.
+3. Destination promotes, verifies its live state and completes the acknowledgement exchange.
 
 Convenience safety checks, bells, and whistles:
 
 - Check and wait for validator health before failing over
 - Wait for the estimated best slot time to failover
 - Wait for no leader slots in the near future (if things go sideways — make it hurt a little less by not being leader 😬)
-- Post-failover vote credit rank monitoring
+- Fresh identity, health, slot, genesis and vote-authority checks
 - Pre/post failover hooks
 - Customizable validator client and set identity commands to support (most) any validator client
 
@@ -44,11 +121,11 @@ solana-validator-failover run --not-a-drill
 solana-validator-failover run
 ```
 
-By default, `run` executes in **dry-run mode**: the tower file is synced and all timings are recorded, but set-identity commands are not executed. This is useful for gauging failover speed under real network conditions without committing. Pass `--not-a-drill` on the **passive** node to execute for real.
+By default, `run` executes in **dry-run mode**: readiness and the authenticated protocol are checked, but identity commands, hooks and tower writes are skipped. Pass `--not-a-drill` on the **passive** node to execute for real. A dry run does not measure the real 512-slot wait.
 
 > ⚠️ **Who you run this as matters.** The user must have:
 > - Permission to run set-identity commands for the validator
-> - Read/write permission on the tower file — verify inherited permissions after a dry-run
+> - Read/write permission on Agave tower files for a real compatible transfer; native clients do not use them
 
 ### Flags
 
@@ -59,7 +136,7 @@ By default, `run` executes in **dry-run mode**: the tower file is synced and all
 | `--not-a-drill`                | `false` | Execute failover for real. Effective on the passive node; ignored on the active node.                                                                             |
 | `--no-wait-for-healthy`        | `false` | Skip waiting for the node to report healthy at `<rpc_address>/health`.                                                                                            |
 | `--no-min-time-to-leader-slot` | `false` | Skip waiting for the active node to have no leader slots in the next `min_time_to_leader_slot` window. Effective on the active node; ignored on the passive node. |
-| `--skip-tower-sync`            | `false` | Skip syncing the tower file from active to passive. The passive node must not have an existing tower file.                                                        |
+| `--skip-tower-sync`            | `false` | Deprecated: native mode negotiates its guarded path automatically; rejected for Agave-only pairs.                                                        |
 | `-y, --yes`                    | `false` | Skip all interactive confirmation prompts.                                                                                                                        |
 | `--to-peer <name\|ip>`         | —       | When run on the active node, auto-select a peer by its configured name or IP address, skipping the interactive selector. Ignored on the passive node.             |
 
@@ -87,13 +164,13 @@ solana-validator-failover run --to-peer backup-validator-region-x --yes
 
 ### Download binary
 
-Download and install the latest [release](https://github.com/SOL-Strategies/solana-validator-failover/releases) binary for your system.
+Build this fork from the pinned source revision. Upstream release binaries do not contain the protocol-3 native handover changes.
 
 ### From source
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/sol-strategies/solana-validator-failover.git
+   git clone https://github.com/plsystems-dev/solana-validator-failover.git
    cd solana-validator-failover
    ```
 
@@ -101,7 +178,7 @@ Download and install the latest [release](https://github.com/SOL-Strategies/sola
    ```bash
    make build
    # or manually:
-   go build -o bin/solana-validator-failover ./cmd/solanavalidatorfailover
+   go build -o bin/solana-validator-failover .
    ```
 
 3. **Copy the binary to where you need it:**
@@ -115,7 +192,7 @@ Download and install the latest [release](https://github.com/SOL-Strategies/sola
 
 2. **Some focus and appreciation of what you're doing** — these can be high pucker factor operations regardless of tooling.
 
-3. **Local validator started with `--full-rpc-api`** — this tool calls `getClusterNodes` on the local RPC, which requires the validator to be started with the `--full-rpc-api` flag (Agave/Firedancer). For resilient peer discovery, configure a private cluster RPC that also supports `getClusterNodes`; it is used when the local validator's gossip view does not contain the peer.
+3. **Suitable local and independent RPC endpoints** — use `--full-rpc-api` for Agave. Native Firedancer uses its TOML RPC configuration; do not pass Agave flags to it. For resilient peer discovery, configure a private cluster RPC that also supports `getClusterNodes`; it is used when the local validator's gossip view does not contain the peer.
 
 ## Configuration
 
@@ -335,7 +412,7 @@ validator:
             environment: # optional map of custom environment variables (values support template interpolation)
               MY_VAR: "{{ .ThisNodeName }}"
               PEER_IP: "{{ .PeerNodePublicIP }}"
-      # hooks to run after failover - errors in post hooks are displayed but do not affect the failover result
+      # hooks to run after failover; must_succeed errors propagate before completion acknowledgement
       post:
         # run after failover when validator is active
         when_active:
@@ -353,51 +430,9 @@ validator:
             environment: # optional map of custom environment variables (values support template interpolation)
               MY_VAR: "{{ .ThisNodeName }}"
               PEER_IP: "{{ .PeerNodePublicIP }}"
-    # (optional) Automatic rollback configuration.
-    # When enabled, if a failover fails after the active node has already switched to passive,
-    # the passive node signals the active node to revert. Both nodes attempt to return to their
-    # original roles.
-    #
-    # IMPORTANT LIMITATIONS — read before enabling:
-    # - Rollback is only triggered by an explicit signal from the passive node. If the network
-    #   connection drops after the passive node successfully sets its identity to active, no
-    #   automatic rollback occurs (to prevent the risk of two active validators). The operator
-    #   must check gossip and intervene manually.
-    # - If the rollback itself fails, the cluster may still be left without an active leader.
-    #   Rollback failures are logged at ERROR level with manual recovery commands.
-    # - Both nodes must have rollback enabled and configured identically for coordination to work.
-    # - Rollback hooks are always run (pre then post), even if the set-identity command fails.
+    # The fenced protocol rejects automatic rollback. Use an explicit reverse handover.
     rollback:
-      # default: false — opt-in
       enabled: false
-
-      # Configuration for reverting the active node (which switched to passive) back to active.
-      # Triggered when the passive node signals that it failed to become active.
-      to_active:
-        # Go template for the rollback set-identity command.
-        # Supports the same template fields as set_identity_active_cmd_template.
-        # When empty, defaults to set_identity_active_cmd_template.
-        cmd_template: ""
-        hooks:
-          # run after the rollback set-identity command (always runs, even if cmd failed)
-          post:
-            - name: notify-rollback-to-active
-              command: ./scripts/notify_rollback.sh
-              args: ["to-active"]
-
-      # Configuration for re-asserting the passive node's passive identity when it failed to
-      # become active. Triggered on the passive node when set-identity-to-active fails.
-      to_passive:
-        # Go template for the rollback set-identity command.
-        # Supports the same template fields as set_identity_passive_cmd_template.
-        # When empty, defaults to set_identity_passive_cmd_template.
-        cmd_template: ""
-        hooks:
-          # run after the rollback set-identity command (always runs, even if cmd failed)
-          post:
-            - name: notify-rollback-to-passive
-              command: ./scripts/notify_rollback.sh
-              args: ["to-passive"]
 
 # update check configuration
 update:
@@ -409,32 +444,11 @@ update:
 
 ## Rollback
 
-`failover.rollback` is an opt-in feature that attempts to automatically revert both nodes to their original roles if a failover fails after identities have started changing.
-
-### When it triggers
-
-Rollback is only triggered by an **explicit signal** from the passive node. Specifically: after the active node has switched to passive and sent the tower file, if the passive node's `set-identity-to-active` command fails, it signals the active node to revert before exiting.
-
-### What it does
-
-| Node                                             | Rollback action                                                           |
-| ------------------------------------------------ | ------------------------------------------------------------------------- |
-| Active node (was active, became passive)         | Runs `set-identity-to-active` command → `rollback.to_active` post-hooks   |
-| Passive node (tried and failed to become active) | Runs `set-identity-to-passive` command → `rollback.to_passive` post-hooks |
-
-Post-hooks always run even if the set-identity command fails. Pre hooks are intentionally not supported for rollback: a pre hook with `must_succeed: true` could block the rollback set-identity command from running, which would defeat the purpose of rollback.
-
-### Limitations
-
-**No auto-rollback on connection drop.** If the network connection drops after the passive node *successfully* set its identity to active (but before the client received confirmation), the active node does **not** automatically rollback. Auto-rollback in this scenario would risk creating two active validators. Instead, a `CRITICAL` log is emitted with the manual recovery command, and the operator must check gossip to determine the actual cluster state.
-
-**Rollback can itself fail.** If the rollback set-identity command fails, both nodes may still be passive. Rollback failures are logged at `ERROR` level with the manual recovery command. There is no retry — operators must intervene.
-
-**Both nodes must be configured identically.** Rollback config is local to each node's config file. Both nodes must have `rollback.enabled: true` and the correct commands configured.
-
-### Rollback is shown in the failover plan
-
-When `rollback.enabled: true`, the pre-failover plan shows the rollback commands that would run on each node if the failover fails, giving operators visibility before they confirm.
+Keep `failover.rollback.enabled: false`. A failed command can have an ambiguous
+outcome; reactivating the source before proving destination fencing can create
+two signers. The fork reports failure and leaves recovery to the controller or
+operator. A normal reverse handover applies the same acknowledgement and
+native lockout guard with the participants' current roles.
 
 ## Troubleshooting gossip peer discovery
 

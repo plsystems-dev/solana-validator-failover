@@ -9,6 +9,30 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestFiredancerDefaultsAndCustomCommands(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "native.yaml")
+		body := "validator:\n  client: firedancer\n  firedancer_config: /etc/samba/validator.toml\n"
+		if custom {
+			body += "  failover:\n    set_identity_active_cmd_template: /usr/local/bin/custom-promote\n"
+		}
+		require.NoError(t, os.WriteFile(path, []byte(body), 0600))
+		cfg, err := NewFromFile(path)
+		require.NoError(t, err)
+		require.Equal(t, "firedancer", cfg.Validator.Client)
+		require.Equal(t, "firedancer", cfg.Validator.Bin)
+		require.Equal(t, uint64(32), cfg.Validator.Failover.MaxSlotLag)
+		require.Equal(t, "/etc/samba/validator.toml", cfg.Validator.FiredancerConfig)
+		if custom {
+			require.Equal(t, "/usr/local/bin/custom-promote", cfg.Validator.Failover.SetIdentityActiveCmdTemplate)
+		} else {
+			require.Contains(t, cfg.Validator.Failover.SetIdentityActiveCmdTemplate, "--config {{ .FiredancerConfig }}")
+			require.NotContains(t, cfg.Validator.Failover.SetIdentityActiveCmdTemplate, "--ledger")
+			require.NotContains(t, cfg.Validator.Failover.SetIdentityActiveCmdTemplate, "--require-tower")
+		}
+	}
+}
+
 func TestNewFromFile_WithValidConfig(t *testing.T) {
 	// Create a temporary config file
 	tempDir := t.TempDir()

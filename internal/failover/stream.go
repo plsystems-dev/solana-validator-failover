@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/huh/spinner"
 	"github.com/charmbracelet/log"
-	"github.com/quic-go/quic-go"
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
 	"github.com/sol-strategies/solana-validator-failover/internal/solana"
 	"github.com/sol-strategies/solana-validator-failover/internal/style"
@@ -20,13 +20,19 @@ import (
 // Stream is the message sent from the active node to the passive node (server) to initiate the failover process
 type Stream struct {
 	message Message
-	Stream  *quic.Stream
+	Stream  messageStream
 	decoder *gob.Decoder
 	encoder *gob.Encoder
 }
 
+type messageStream interface {
+	io.ReadWriteCloser
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
 // NewFailoverStream creates a new FailoverStream from a QUIC stream
-func NewFailoverStream(stream *quic.Stream) *Stream {
+func NewFailoverStream(stream messageStream) *Stream {
 	decoder := gob.NewDecoder(stream)
 	encoder := gob.NewEncoder(stream)
 
@@ -52,11 +58,13 @@ func (s *Stream) Encode() error {
 
 // Decode decodes the FailoverStream from the stream
 func (s *Stream) Decode() error {
-	err := s.decoder.Decode(&s.message)
+	var next Message
+	err := s.decoder.Decode(&next)
 	if err != nil {
 		log.Error("failed to decode failover message", "err", err)
 		return err
 	}
+	s.message = next
 	return nil
 }
 

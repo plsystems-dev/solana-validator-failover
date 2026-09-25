@@ -9,6 +9,9 @@ import (
 
 // Config is the configuration for the validator
 type Config struct {
+	Client              string            `mapstructure:"client"`
+	FiredancerConfig    string            `mapstructure:"firedancer_config"`
+	VoteAccount         string            `mapstructure:"vote_account"`
 	Bin                 string            `mapstructure:"bin"`
 	Cluster             string            `mapstructure:"cluster"`
 	ClusterRPCURL       string            `mapstructure:"cluster_rpc_url"`
@@ -31,6 +34,7 @@ type TowerConfig struct {
 
 // FailoverConfig is the configuration for a failover
 type FailoverConfig struct {
+	MaxSlotLag                    uint64               `mapstructure:"max_slot_lag"`
 	SetIdentityPassiveCmdTemplate string               `mapstructure:"set_identity_passive_cmd_template"`
 	SetIdentityActiveCmdTemplate  string               `mapstructure:"set_identity_active_cmd_template"`
 	Hooks                         hooks.FailoverHooks  `mapstructure:"hooks"`

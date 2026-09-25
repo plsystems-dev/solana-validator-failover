@@ -6,6 +6,11 @@ import (
 
 // Message represents the message data that can be encoded/decoded
 type Message struct {
+	Phase                            string
+	Sequence                         uint64
+	SourceStatus                     RuntimeStatus
+	GuardAnchor                      uint64
+	RequiredQuietSlots               uint64
 	CanProceed                       bool
 	ErrorMessage                     string
 	ActiveNodeInfo                   NodeInfo

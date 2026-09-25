@@ -378,21 +378,29 @@ func (h FailoverHooks) RunPreWhenActive(envMap map[string]string) error {
 }
 
 // RunPostWhenPassive runs the post hooks when the validator is passive
-func (h FailoverHooks) RunPostWhenPassive(envMap map[string]string) {
+func (h FailoverHooks) RunPostWhenPassive(envMap map[string]string) error {
 	for i, hook := range h.Post.WhenPassive {
 		err := hook.Run(envMap, "post", i+1, len(h.Post.WhenPassive))
 		if err != nil {
 			log.Error("post hook failed", "hook", hook.Name, "err", err)
+			if hook.MustSucceed {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 // RunPostWhenActive runs the post hooks when the validator is active
-func (h FailoverHooks) RunPostWhenActive(envMap map[string]string) {
+func (h FailoverHooks) RunPostWhenActive(envMap map[string]string) error {
 	for i, hook := range h.Post.WhenActive {
 		err := hook.Run(envMap, "post", i+1, len(h.Post.WhenActive))
 		if err != nil {
 			log.Error("post hook failed", "hook", hook.Name, "err", err)
+			if hook.MustSucceed {
+				return err
+			}
 		}
 	}
+	return nil
 }
