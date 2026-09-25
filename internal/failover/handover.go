@@ -260,7 +260,11 @@ func (s *Server) runDestination() (err error) {
 			return err
 		}
 		f.message.GuardAnchor = target - NativeQuietSlots
-		s.logger.Infof("source demotion verified; finalized slot guard target=%d", target)
+		if s.isDryRunFailover {
+			s.logger.Infof("dry run: negotiated %d-slot policy; no source fence, slot wait or identity changes performed", quiet)
+		} else {
+			s.logger.Infof("source demotion verified; finalized slot guard target=%d", target)
+		}
 	}
 	// Save the received tower before later proof messages replace message data.
 	towerBytes := append([]byte(nil), f.message.ActiveNodeInfo.TowerFileBytes...)
@@ -364,7 +368,11 @@ func (s *Server) runDestination() (err error) {
 	if f.message.Phase != "complete-ack" {
 		return fmt.Errorf("invalid completion acknowledgement")
 	}
-	s.logger.Info("verified handover complete")
+	if s.isDryRunFailover {
+		s.logger.Info("dry run verified; identities unchanged")
+	} else {
+		s.logger.Info("verified handover complete")
+	}
 	return nil
 }
 

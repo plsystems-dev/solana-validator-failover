@@ -198,7 +198,8 @@ func RenderFailoverPlan(data PlanData) (string, error) {
   {{ HRule }}
   {{ Purple "   Plan:" }} {{ planSummaryLines .ActiveNodeInfo.Hostname .PassiveNodeInfo.Hostname .SkipTowerSync .Hooks .Rollback }}
   {{ Purple "Version:" }} {{ Muted .AppVersion }}
-  {{ if .IsDryRun }}{{ Blue "   Note:" }} {{ Muted "dry run — re-run with" }} {{ LightGrey "--not-a-drill" }} {{ Muted "on the passive node to do for realsies." }}{{ else }}{{ Warning "Warning:" }} {{ Muted "This is a real failover — identities will be changed on both nodes." }}{{ end }}
+  {{ if .IsDryRun }}{{ Blue "   Note:" }} {{ Muted "Dry run only: identity changes, hooks and tower writes are skipped." }}
+          {{ Muted "To execute the handover, re-run with" }} {{ LightGrey "--not-a-drill" }} {{ Muted "on the passive participant." }}{{ else }}{{ Warning "Warning:" }} {{ Muted "This is a real failover — identities will be changed on both nodes." }}{{ end }}
   {{ HRule }}
 `)
 	if err != nil {

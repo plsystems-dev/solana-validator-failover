@@ -1,6 +1,7 @@
 package failover
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -246,6 +247,8 @@ func TestHandoverPromotionFailureDoesNotReactivateSource(t *testing.T) {
 func TestHandoverNativeDryRunDoesNotMutate(t *testing.T) {
 	f := newHandoverFixture(t, "agave", "firedancer")
 	f.server.isDryRunFailover = true
+	var output bytes.Buffer
+	f.server.logger = log.New(&output)
 	marker := filepath.Join(t.TempDir(), "hook-ran")
 	f.server.hooks.Pre.WhenPassive = []hooks.Hook{{Name: "mutation", Command: "touch", Args: []string{marker}, MustSucceed: true}}
 	a, b := f.run(t)
@@ -256,6 +259,16 @@ func TestHandoverNativeDryRunDoesNotMutate(t *testing.T) {
 	content, err := os.ReadFile(f.server.passiveNodeInfo.TowerFile)
 	require.NoError(t, err)
 	require.Equal(t, "old destination tower", string(content))
+	require.Contains(t, output.String(), "dry run: negotiated 512-slot policy; no source fence, slot wait or identity changes performed")
+	require.Contains(t, output.String(), "dry run verified; identities unchanged")
+	require.NotContains(t, output.String(), "source demotion verified")
+	require.NotContains(t, output.String(), "verified handover complete")
+	plan, err := RenderFailoverPlan(PlanData{IsDryRun: true, SkipTowerSync: true,
+		ActiveNodeInfo: *f.client.activeNodeInfo, PassiveNodeInfo: *f.server.passiveNodeInfo})
+	require.NoError(t, err)
+	require.Contains(t, plan, "Dry run only: identity changes, hooks and tower writes are skipped.")
+	require.Contains(t, plan, "on the passive participant.")
+	require.NotContains(t, plan, "for realsies")
 }
 
 func (f safetyReaderFunc) VoteAdvanced(context.Context, string, string, uint64) (bool, error) {
