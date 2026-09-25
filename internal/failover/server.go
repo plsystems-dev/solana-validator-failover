@@ -56,7 +56,6 @@ type Server struct {
 	safety            safetyReader
 	maxSlotLag        uint64
 	runCommand        func(context.Context, string, bool) error
-	pollInterval      time.Duration
 	voteTimeout       time.Duration
 	votePollInterval  time.Duration
 	port              int
@@ -108,7 +107,6 @@ func NewServerFromConfig(config ServerConfig) (*Server, error) {
 		safety:           config.Safety,
 		maxSlotLag:       config.MaxSlotLag,
 		runCommand:       runIdentityCommand,
-		pollInterval:     guardPollInterval,
 		voteTimeout:      time.Minute,
 		votePollInterval: 2 * time.Second,
 		port:             config.Port,

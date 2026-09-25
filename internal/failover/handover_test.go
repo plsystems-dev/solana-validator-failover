@@ -213,19 +213,19 @@ func TestHandoverLostSourceProofNeverPromotes(t *testing.T) {
 	require.Equal(t, []string{"source-demoted"}, f.events)
 }
 
-func TestHandoverStaleProofSequenceNeverPromotes(t *testing.T) {
+func TestHandoverSourceReactivationDuringProofNeverPromotes(t *testing.T) {
 	f := newHandoverFixture(t, "agave", "firedancer")
 	reads := 0
 	f.client.safety = safetyReaderFunc(func(ctx context.Context) (RuntimeStatus, error) {
 		reads++
 		if reads == 4 {
-			f.client.failoverStream.message.Sequence--
+			f.source.setIdentity(testActive)
 		}
 		return f.source.Snapshot(ctx)
 	})
 	a, b := f.run(t)
 	require.Error(t, a)
-	require.ErrorContains(t, b, "invalid source fence proof")
+	require.ErrorContains(t, b, "identity is")
 	require.Equal(t, []string{"source-demoted"}, f.events)
 }
 
@@ -259,7 +259,7 @@ func TestHandoverNativeDryRunDoesNotMutate(t *testing.T) {
 	content, err := os.ReadFile(f.server.passiveNodeInfo.TowerFile)
 	require.NoError(t, err)
 	require.Equal(t, "old destination tower", string(content))
-	require.Contains(t, output.String(), "dry run: negotiated 512-slot policy; no source fence, slot wait or identity changes performed")
+	require.Contains(t, output.String(), "dry run: negotiated immediate handover; no source fence or identity changes performed")
 	require.Contains(t, output.String(), "dry run verified; identities unchanged")
 	require.NotContains(t, output.String(), "source demotion verified")
 	require.NotContains(t, output.String(), "verified handover complete")
@@ -281,28 +281,9 @@ type safetyReaderFunc func(context.Context) (RuntimeStatus, error)
 
 func (f safetyReaderFunc) Snapshot(ctx context.Context) (RuntimeStatus, error) { return f(ctx) }
 
-func TestQuietSlotBoundaryAndLag(t *testing.T) {
-	s := RuntimeStatus{Identity: testSourcePassive, Processed: 1000, Finalized: 1000, ClusterProcessed: 1000, ClusterFinalized: 1000}
-	d := s
-	d.Identity = testDestinationPassive
-	d.Processed = 1002
-	d.ClusterProcessed = 1002
-	target, err := guardTarget(s, d)
-	require.NoError(t, err)
-	require.Equal(t, uint64(1514), target)
-	s.Finalized = target
-	s.ClusterFinalized = target
-	d.Finalized = target - 1
-	d.ClusterFinalized = target
-	require.False(t, quietPeriodComplete(target, s, d), "511 elapsed destination slots must not pass")
-	d.Finalized = target
-	require.True(t, quietPeriodComplete(target, s, d))
-	d.Processed = target
-	d.ClusterProcessed = target + 33
-	require.ErrorContains(t, d.validate(testDestinationPassive, 32), "differ by 33")
-	s.Processed = ^uint64(0)
-	_, err = guardTarget(s, d)
-	require.ErrorContains(t, err, "overflow")
+func TestRuntimeStatusRejectsLag(t *testing.T) {
+	status := RuntimeStatus{Identity: testDestinationPassive, Processed: 1000, Finalized: 1000, ClusterProcessed: 1033, ClusterFinalized: 1000}
+	require.ErrorContains(t, status.validate(testDestinationPassive, 32), "differ by 33")
 }
 
 func TestCapabilitiesRejectBeforeAnyMutation(t *testing.T) {

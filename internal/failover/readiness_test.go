@@ -78,18 +78,18 @@ type readinessOverride struct {
 func (r *readinessOverride) CheckReadiness(context.Context, string, string, bool) error {
 	r.checks++
 	if r.checks == 2 {
-		return fmt.Errorf("authority changed during slot guard")
+		return fmt.Errorf("authority changed before promotion")
 	}
 	return nil
 }
 
-func TestAuthorityRecheckedAfterGuardBeforePromotion(t *testing.T) {
+func TestAuthorityRecheckedBeforePromotion(t *testing.T) {
 	f := newHandoverFixture(t, "agave", "firedancer")
 	reader := &readinessOverride{safetyReader: f.server.safety}
 	f.server.safety = reader
 	a, b := f.run(t)
 	require.Error(t, a)
-	require.ErrorContains(t, b, "authority changed during slot guard")
+	require.ErrorContains(t, b, "authority changed before promotion")
 	require.Equal(t, []string{"source-demoted"}, f.events)
 	require.Equal(t, 2, reader.checks)
 }

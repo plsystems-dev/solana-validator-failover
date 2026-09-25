@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	solanago "github.com/gagliardetto/solana-go"
 	"github.com/sol-strategies/solana-validator-failover/internal/hooks"
 	"github.com/sol-strategies/solana-validator-failover/internal/solana"
 	"github.com/stretchr/testify/require"
@@ -45,7 +46,7 @@ func handoverTLS(t *testing.T) (*tls.Config, *tls.Config) {
 // This RPC intentionally implements only the native methods used for safety.
 // Other endpoints return method-not-found, preventing accidental dependence on
 // native getVoteAccounts/getLeaderSchedule support.
-func handoverRPC(t *testing.T, state *testRuntime, clock *atomic.Uint64, switched func(string), voteSlots ...func() uint64) *httptest.Server {
+func handoverRPC(t *testing.T, state *testRuntime, clock *atomic.Uint64, advancing *atomic.Bool, switched func(string), voteSlots ...func() uint64) *httptest.Server {
 	t.Helper()
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/switch" {
@@ -81,7 +82,10 @@ func handoverRPC(t *testing.T, state *testRuntime, clock *atomic.Uint64, switche
 			state.mu.Unlock()
 			result = map[string]string{"identity": identity}
 		case "getSlot":
-			result = clock.Add(1)
+			result = clock.Load()
+			if advancing.Load() {
+				result = clock.Add(1)
+			}
 		case "getVoteAccounts":
 			state.mu.Lock()
 			isLocal := state.identity != ""
@@ -167,15 +171,24 @@ func TestQUICMTLSHandover(t *testing.T) {
 				f := newHandoverFixture(t, direction[0], direction[1])
 				var clock atomic.Uint64
 				clock.Store(1000)
-				sourceRPC := handoverRPC(t, f.source, &clock, func(string) { f.record("source-demoted") })
-				destinationRPC := handoverRPC(t, f.destination, &clock, func(string) { f.record("destination-promoted") })
+				var advancing atomic.Bool
+				var demotionSlot, activationSlot atomic.Uint64
+				sourceRPC := handoverRPC(t, f.source, &clock, &advancing, func(string) {
+					demotionSlot.Store(clock.Load())
+					f.record("source-demoted")
+				})
+				destinationRPC := handoverRPC(t, f.destination, &clock, &advancing, func(string) {
+					activationSlot.Store(clock.Load())
+					f.record("destination-promoted")
+					advancing.Store(true)
+				})
 				voteSlot := func() uint64 {
 					if scenario == "stale-votes" {
 						return 1000
 					}
 					return clock.Load()
 				}
-				clusterRPC := handoverRPC(t, &testRuntime{}, &clock, nil, voteSlot)
+				clusterRPC := handoverRPC(t, &testRuntime{}, &clock, &advancing, nil, voteSlot)
 				f.client.activeNodeInfo.PublicIP = "127.0.0.1"
 				f.client.activeNodeInfo.RPCAddress = sourceRPC.URL
 				f.client.activeNodeInfo.SetIdentityCommand = fakeIdentityCLI(t, direction[0], sourceRPC.URL, testSourcePassive, false)
@@ -190,7 +203,6 @@ func TestQUICMTLSHandover(t *testing.T) {
 				server, err := NewServerFromConfig(ServerConfig{Port: port, TLSConfig: serverTLS, PassiveNodeInfo: f.server.passiveNodeInfo,
 					Safety: NewSafetyReader(destinationRPC.URL, clusterRPC.URL), IsDryRunFailover: scenario == "dry-run", AutoConfirm: true})
 				require.NoError(t, err)
-				server.pollInterval = 0
 				if scenario == "stale-votes" {
 					server.voteTimeout = 30 * time.Millisecond
 				}
@@ -219,8 +231,13 @@ func TestQUICMTLSHandover(t *testing.T) {
 				}
 				serverDone := make(chan error, 1)
 				go func() { serverDone <- server.Start() }()
+				var scheduleQueries atomic.Int32
+				legacyRPC := solana.NewMockClient().WithGetTimeToNextLeaderSlotForPubkey(func(solanago.PublicKey) (bool, time.Duration, error) {
+					scheduleQueries.Add(1)
+					return false, 0, nil
+				})
 				client, err := NewClientFromConfig(ClientConfig{ServerName: "destination", ServerAddress: fmt.Sprintf("127.0.0.1:%d", port),
-					TLSConfig: clientTLS, ActiveNodeInfo: f.client.activeNodeInfo, Safety: NewSafetyReader(sourceRPC.URL, clusterRPC.URL), SolanaRPCClient: solana.NewMockClient()})
+					TLSConfig: clientTLS, ActiveNodeInfo: f.client.activeNodeInfo, Safety: NewSafetyReader(sourceRPC.URL, clusterRPC.URL), SolanaRPCClient: legacyRPC, WaitMinTimeToLeaderSlotEnabled: true, MinTimeToLeaderSlot: 5 * time.Minute})
 				require.NoError(t, err)
 				clientDone := make(chan error, 1)
 				go func() { clientDone <- client.Start() }()
@@ -235,6 +252,13 @@ func TestQUICMTLSHandover(t *testing.T) {
 						client.cancel()
 						server.cancel()
 						t.Fatal("QUIC participants did not finish")
+					}
+				}
+				require.Zero(t, scheduleQueries.Load(), "mixed handover must not query the optional leader window")
+				if scenario != "dry-run" {
+					require.Equal(t, uint64(1000), demotionSlot.Load())
+					if scenario != "lost-before-commit" {
+						require.Equal(t, uint64(1000), activationSlot.Load(), "promotion must precede any head or finalization advance")
 					}
 				}
 				switch scenario {

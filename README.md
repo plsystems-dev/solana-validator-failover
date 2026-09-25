@@ -1,8 +1,8 @@
 # solana-validator-failover
 
-This PL Systems fork is `0.1.22-pl.1`, based on upstream `v0.1.22`, commit
+This PL Systems fork is `0.1.22-pl.2`, based on upstream `v0.1.22`, commit
 [`613764b50c1282a0274cde11c79ec3c3d593e433`](https://github.com/SOL-Strategies/solana-validator-failover/commit/613764b50c1282a0274cde11c79ec3c3d593e433).
-It supports Agave/Salsa and full Firedancer/Samba with wire protocol **3**.
+It supports Agave/Salsa and full Firedancer/Samba with wire protocol **4**.
 Both participants must run this protocol; older peers fail before identity changes.
 
 ## Native and mixed-client handover
@@ -36,21 +36,25 @@ Do not override native commands with the Agave templates in the example below.
 Native ledger/tower paths are ignored and no dummy tower is required.
 
 Every transfer requires an explicit source-demoted acknowledgement. If either
-participant is native, both must use mTLS, advertise the same vote account, and
-wait until **both local and both independent finalized-slot views** reach a
-post-demotion processed-slot anchor plus **512 slots**. During that wait, the
-source answers fresh, sequenced identity/health/head challenges. The destination
-rechecks its identity, health and head; both genesis hashes and the epoch-effective
-vote authority are checked using the independent RPC. Authority is rechecked
-after the wait, immediately before promotion. Native mode requires the effective
-voter to equal the active identity, matching the identity-only signer profile.
+participant is native, both must use mTLS and advertise the same vote account.
+After demotion, the source answers a fresh identity/health/head challenge. The
+destination rechecks its identity, health and head; both genesis hashes and the
+epoch-effective vote authority are checked using the independent RPC. Authority
+is rechecked before promotion. Native mode requires the effective voter to equal
+the active identity, matching the identity-only signer profile.
+
+Native and mixed-client handovers proceed immediately after these checks. There
+is no slot/finalization delay or external leader-window wait. The validator's own
+identity command may still drain current work. This is an explicit departure
+from the pinned [Firedancer tower warning](https://github.com/harmonic/samba/blob/eed6c122a9756fc1f6e5021a636a3d6961a76952/src/discof/tower/fd_tower_tile.c#L1733)
+to wait 512 slots when changing identity without importing a compatible tower;
+immediate handover does not provide that lockout-expiry protection.
 
 A compatible Agave-only pair still transfers a verified tower after demotion.
 For native pairs, no tower is transferred. An Agave destination archives its
-stale tower only after the guard passes and promotes without `--require-tower`.
+stale tower only after source demotion and fresh checks, then promotes without
+`--require-tower`.
 Native paths are never touched. The same procedure supports the reverse direction.
-The 512-slot interval is mandatory for the pinned native client; this automates
-the handover but cannot provide uninterrupted voting through it.
 
 **Service coordination is required.** The outer controller must hold each
 node's shared transition lock for the full transaction, quiesce the updater
@@ -64,12 +68,13 @@ Automatic rollback is rejected. A promotion error or lost connection exits
 nonzero and never reactivates the old signer. Inspect both live identities before
 recovery; when reversing a completed transfer, run a new handover with the roles
 reversed. Dry runs perform readiness/protocol checks but skip identity commands,
-all hooks and tower writes; they do not wait out the real 512-slot interval.
+all hooks and tower writes.
 
 Protocol completion verifies identities, health and head, then requires the
 configured vote account's independent `lastVote` to advance strictly beyond the
-guard target (or the post-demotion anchor for Agave-only pairs), with a 60-second
-deadline and repeated local checks. Stale votes cannot complete the transaction.
+post-demotion processed-slot anchor, with a 60-second deadline and repeated local
+checks. This observes voting after promotion; it does not delay activation.
+Stale votes cannot complete the transaction.
 The peer acknowledgement follows this verification; failure leaves automation
 inhibited and never reactivates the old signer. Legacy Agave configurations without
 `vote_account` explicitly report identity-only verification. Leader behavior
@@ -86,21 +91,20 @@ Simple p2p Solana validator failovers. This tool helps automate **planned** fail
 A QUIC-based program that orchestrates safe, fast failovers between Solana validators. [This post](https://solstrategies.io/blog/quic-solana-validator-failovers) covers the background in more detail. In summary, it coordinates three steps across both nodes:
 
 1. Source switches passive and positively acknowledges demotion.
-2. Compatible Agave pairs transfer a tower; native pairs complete the guarded 512-slot wait.
+2. Source proves it remains passive; compatible Agave pairs also transfer a tower.
 3. Destination promotes, verifies its live state and completes the acknowledgement exchange.
 
 Convenience safety checks, bells, and whistles:
 
 - Check and wait for validator health before failing over
-- Wait for the estimated best slot time to failover
-- Wait for no leader slots in the near future (if things go sideways — make it hurt a little less by not being leader 😬)
+- Optionally wait for a gap in the leader schedule for Agave-only transfers
 - Fresh identity, health, slot, genesis and vote-authority checks
 - Pre/post failover hooks
 - Customizable validator client and set identity commands to support (most) any validator client
 
 ## How it works
 
-Running `solana-validator-failover run` on either node **automatically detects the node's role** (active or passive) from gossip and does the right thing:
+Running `solana-validator-failover run` on either node **automatically detects the node's role** (active or passive) from its local RPC identity:
 
 - **Passive node** → starts a QUIC server, waits for the active node to connect
 - **Active node** → connects to the passive peer as a QUIC client and orchestrates the handover
@@ -121,7 +125,7 @@ solana-validator-failover run --not-a-drill
 solana-validator-failover run
 ```
 
-By default, `run` executes in **dry-run mode**: readiness and the authenticated protocol are checked, but identity commands, hooks and tower writes are skipped. Pass `--not-a-drill` on the **passive** node to execute for real. A dry run does not measure the real 512-slot wait.
+By default, `run` executes in **dry-run mode**: readiness and the authenticated protocol are checked, but identity commands, hooks and tower writes are skipped. Pass `--not-a-drill` on the **passive** node to execute for real.
 
 > ⚠️ **Who you run this as matters.** The user must have:
 > - Permission to run set-identity commands for the validator
@@ -135,8 +139,8 @@ By default, `run` executes in **dry-run mode**: readiness and the authenticated 
 | ------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--not-a-drill`                | `false` | Execute failover for real. Effective on the passive node; ignored on the active node.                                                                             |
 | `--no-wait-for-healthy`        | `false` | Skip waiting for the node to report healthy at `<rpc_address>/health`.                                                                                            |
-| `--no-min-time-to-leader-slot` | `false` | Skip waiting for the active node to have no leader slots in the next `min_time_to_leader_slot` window. Effective on the active node; ignored on the passive node. |
-| `--skip-tower-sync`            | `false` | Deprecated: native mode negotiates its guarded path automatically; rejected for Agave-only pairs.                                                        |
+| `--no-min-time-to-leader-slot` | `false` | Skip the optional leader-window wait for Agave-only transfers. Native/mixed transfers always skip this wait. |
+| `--skip-tower-sync`            | `false` | Deprecated: native handovers skip tower transfer automatically; rejected for Agave-only pairs. |
 | `-y, --yes`                    | `false` | Skip all interactive confirmation prompts.                                                                                                                        |
 | `--to-peer <name\|ip>`         | —       | When run on the active node, auto-select a peer by its configured name or IP address, skipping the interactive selector. Ignored on the passive node.             |
 
@@ -164,7 +168,7 @@ solana-validator-failover run --to-peer backup-validator-region-x --yes
 
 ### Download binary
 
-Build this fork from the pinned source revision. Upstream release binaries do not contain the protocol-3 native handover changes.
+Build this fork from the pinned source revision. Upstream release binaries do not contain the protocol-4 native handover changes.
 
 ### From source
 
@@ -323,9 +327,8 @@ validator:
         # host and port to connect to failover server
         address: backup-validator-region-x.some-private.zone:9898
 
-    # duration string representing the minimum amount of time before the active node is due to
-    # be the leader; if the failover is initiated below this threshold it will wait until this
-    # window has passed before connecting to the passive peer
+    # Agave-only: optional minimum time before the active node's next leader slot.
+    # If too close, wait before demotion. Native/mixed transfers ignore this field.
     # default: 5m
     min_time_to_leader_slot: 5m
 
@@ -447,8 +450,8 @@ update:
 Keep `failover.rollback.enabled: false`. A failed command can have an ambiguous
 outcome; reactivating the source before proving destination fencing can create
 two signers. The fork reports failure and leaves recovery to the controller or
-operator. A normal reverse handover applies the same acknowledgement and
-native lockout guard with the participants' current roles.
+operator. A normal reverse handover applies the same source acknowledgement and
+fresh checks with the participants' current roles.
 
 ## Troubleshooting gossip peer discovery
 

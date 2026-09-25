@@ -50,8 +50,8 @@ var (
 func init() {
 	runCmd.Flags().BoolVar(&notADrill, "not-a-drill", false, "execute failover for real (not a drill)")
 	runCmd.Flags().BoolVar(&noWaitForHealthy, "no-wait-for-healthy", false, "don't wait for node to report being healthy by calling <config.validator.rpc_address>/health")
-	runCmd.Flags().BoolVar(&noMinTimeToLeaderSlot, "no-min-time-to-leader-slot", false, "when run on an active node, don't wait until it has no leader slots in the next <config.validator.min_time_to_leader_slot> (default: 5m) - ignored when run on a passive node")
-	runCmd.Flags().BoolVar(&skipTowerSync, "skip-tower-sync", false, "deprecated: native handovers negotiate the slot guard automatically; rejected for Agave-only pairs")
+	runCmd.Flags().BoolVar(&noMinTimeToLeaderSlot, "no-min-time-to-leader-slot", false, "skip the optional leader-window wait for Agave-only transfers; native/mixed transfers always skip it")
+	runCmd.Flags().BoolVar(&skipTowerSync, "skip-tower-sync", false, "deprecated: native handovers skip tower transfer automatically; rejected for Agave-only pairs")
 	runCmd.Flags().BoolVarP(&autoConfirm, "yes", "y", false, "automatically answer yes to all prompts")
 	runCmd.Flags().BoolVarP(&rollbackEnabled, "rollback-enabled", "r", false, "deprecated: automatic rollback is rejected by the fenced protocol")
 	runCmd.Flags().StringVar(&toPeer, "to-peer", "", "when run on an active node, auto-select a peer by name or IP address (skips interactive prompt)")

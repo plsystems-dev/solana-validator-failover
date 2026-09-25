@@ -49,17 +49,22 @@ func (c *Client) runSource() (err error) {
 	if f.GetPassiveNodeInfo().SolanaValidatorFailoverVersion != pkgconstants.AppVersion {
 		return fmt.Errorf("peer application version differs")
 	}
-	quiet, err := negotiatedQuietSlots(c.activeNodeInfo, f.GetPassiveNodeInfo(), c.skipTowerSync, c.rollback.Enabled, c.tlsConfig != nil)
+	transferTower, err := negotiateTowerTransfer(c.activeNodeInfo, f.GetPassiveNodeInfo(), c.skipTowerSync, c.rollback.Enabled, c.tlsConfig != nil)
 	if err != nil {
 		return err
 	}
-	if quiet != f.message.RequiredQuietSlots {
-		return fmt.Errorf("peer proposed an incompatible lockout policy")
+	if transferTower == f.GetSkipTowerSync() {
+		return fmt.Errorf("peer proposed an incompatible tower-transfer policy")
 	}
 	dry := f.GetIsDryRunFailover()
 	if !dry {
-		if err := c.waitMinTimeToLeaderSlot(); err != nil {
-			return err
+		// Preserve optional leader-window scheduling for compatible Agave
+		// transfers. Native/mixed handovers proceed directly; the validator's
+		// own identity command drains current work as needed.
+		if transferTower {
+			if err := c.waitMinTimeToLeaderSlot(); err != nil {
+				return err
+			}
 		}
 		if err := c.hooks.RunPreWhenActive(c.getHookEnvMap(hookEnvMapParams{isPreFailover: true})); err != nil {
 			return err
@@ -72,7 +77,7 @@ func (c *Client) runSource() (err error) {
 	if err := before.validate(c.activeNodeInfo.Identities.Active.PubKey(), c.maxSlotLag); err != nil {
 		return err
 	}
-	if err := c.safety.CheckReadiness(c.ctx, c.activeNodeInfo.VoteAccount, c.activeNodeInfo.Identities.Active.PubKey(), quiet != 0); err != nil {
+	if err := c.safety.CheckReadiness(c.ctx, c.activeNodeInfo.VoteAccount, c.activeNodeInfo.Identities.Active.PubKey(), !transferTower); err != nil {
 		return err
 	}
 	f.SetFailoverStartSlot(before.Processed)
@@ -95,7 +100,7 @@ func (c *Client) runSource() (err error) {
 	f.message.SourceStatus = status
 	// Both transfer modes must send this acknowledgement. Tower transfer is an
 	// optional payload, never the protocol's implicit demotion barrier.
-	if quiet == 0 {
+	if transferTower {
 		if err := c.activeNodeInfo.SetTowerFileBytes(); err != nil {
 			return err
 		}
@@ -107,52 +112,44 @@ func (c *Client) runSource() (err error) {
 	if err := sendPhase(f, "demoted"); err != nil {
 		return err
 	}
-	var sequence uint64
-	for {
-		if err := receivePhase(f, 2*time.Minute); err != nil {
-			return fmt.Errorf("handover outcome unknown; keep source fenced: %w", err)
+	if !dry {
+		if err := receivePhase(f, proofTimeout); err != nil {
+			return fmt.Errorf("lost destination before source proof: %w", err)
 		}
-		switch f.message.Phase {
-		case "check-source":
-			if f.message.Sequence != sequence+1 {
-				return fmt.Errorf("invalid source-proof sequence")
-			}
-			sequence++
-			status, err := c.safety.Snapshot(c.ctx)
-			if err != nil {
-				return err
-			}
-			if err := status.validate(expected, c.maxSlotLag); err != nil {
-				return err
-			}
-			f.message.SourceStatus = status
-			if err := sendPhase(f, "source-proof"); err != nil {
-				return err
-			}
-		case "complete":
-			if !f.GetIsSuccessfullyCompleted() {
-				return fmt.Errorf("peer did not confirm completion")
-			}
-			status, err := c.safety.Snapshot(c.ctx)
-			if err != nil {
-				return err
-			}
-			if err := status.validate(expected, c.maxSlotLag); err != nil {
-				return err
-			}
-			if !dry {
-				if err := c.hooks.RunPostWhenPassive(c.getHookEnvMap(hookEnvMapParams{isPostFailover: true})); err != nil {
-					return err
-				}
-			}
-			if err := sendPhase(f, "complete-ack"); err != nil {
-				return err
-			}
-			return nil
-		default:
-			return fmt.Errorf("unexpected handover phase %q", f.message.Phase)
+		if f.message.Phase != "check-source" {
+			return fmt.Errorf("expected fresh source-proof request")
+		}
+		status, err := c.safety.Snapshot(c.ctx)
+		if err != nil {
+			return err
+		}
+		if err := status.validate(expected, c.maxSlotLag); err != nil {
+			return err
+		}
+		f.message.SourceStatus = status
+		if err := sendPhase(f, "source-proof"); err != nil {
+			return err
 		}
 	}
+	if err := receivePhase(f, 2*time.Minute); err != nil {
+		return fmt.Errorf("handover outcome unknown; keep source fenced: %w", err)
+	}
+	if f.message.Phase != "complete" || !f.GetIsSuccessfullyCompleted() {
+		return fmt.Errorf("peer did not confirm completion")
+	}
+	status, err = c.safety.Snapshot(c.ctx)
+	if err != nil {
+		return err
+	}
+	if err := status.validate(expected, c.maxSlotLag); err != nil {
+		return err
+	}
+	if !dry {
+		if err := c.hooks.RunPostWhenPassive(c.getHookEnvMap(hookEnvMapParams{isPostFailover: true})); err != nil {
+			return err
+		}
+	}
+	return sendPhase(f, "complete-ack")
 }
 
 func (s *Server) runDestination() (err error) {
@@ -171,7 +168,7 @@ func (s *Server) runDestination() (err error) {
 	if source.SolanaValidatorFailoverVersion != pkgconstants.AppVersion {
 		return fmt.Errorf("peer application version differs")
 	}
-	quiet, err := negotiatedQuietSlots(&source, s.passiveNodeInfo, s.skipTowerSync,
+	transferTower, err := negotiateTowerTransfer(&source, s.passiveNodeInfo, s.skipTowerSync,
 		s.rollback.Enabled || f.GetActiveRollbackEnabled(), s.mtlsEnabled)
 	if err != nil {
 		return err
@@ -191,7 +188,7 @@ func (s *Server) runDestination() (err error) {
 		}
 	}
 	activeKey := s.passiveNodeInfo.Identities.Active.PubKey()
-	if err := s.safety.CheckReadiness(s.ctx, s.passiveNodeInfo.VoteAccount, activeKey, quiet != 0); err != nil {
+	if err := s.safety.CheckReadiness(s.ctx, s.passiveNodeInfo.VoteAccount, activeKey, !transferTower); err != nil {
 		return err
 	}
 	sourcePassive := source.Identities.Passive.PubKey()
@@ -217,8 +214,7 @@ func (s *Server) runDestination() (err error) {
 	}
 	f.SetPassiveNodeInfo(s.passiveNodeInfo)
 	f.SetIsDryRunFailover(s.isDryRunFailover)
-	f.SetSkipTowerSync(quiet != 0)
-	f.message.RequiredQuietSlots = quiet
+	f.SetSkipTowerSync(!transferTower)
 	if err := f.ConfirmFailover(s.hooks, s.rollback, source.RPCAddress, s.rpcURL, s.autoConfirm); err != nil {
 		return err
 	}
@@ -251,58 +247,31 @@ func (s *Server) runDestination() (err error) {
 	if err := local.validate(destinationPassive, s.maxSlotLag); err != nil {
 		return err
 	}
-	// For an Agave tower transfer, exclude votes already possible at the
-	// post-demotion anchor. Native mode adds the mandatory lockout interval.
-	target := max(f.message.SourceStatus.Processed, f.message.SourceStatus.ClusterProcessed, local.Processed, local.ClusterProcessed)
-	if quiet != 0 {
-		target, err = guardTarget(f.message.SourceStatus, local)
-		if err != nil {
-			return err
-		}
-		f.message.GuardAnchor = target - NativeQuietSlots
-		if s.isDryRunFailover {
-			s.logger.Infof("dry run: negotiated %d-slot policy; no source fence, slot wait or identity changes performed", quiet)
-		} else {
-			s.logger.Infof("source demotion verified; finalized slot guard target=%d", target)
-		}
+	// This post-demotion anchor excludes pre-handover votes from the later
+	// voting-success check. It imposes no delay before destination activation.
+	voteAnchor := max(f.message.SourceStatus.Processed, f.message.SourceStatus.ClusterProcessed, local.Processed, local.ClusterProcessed)
+	if s.isDryRunFailover {
+		s.logger.Info("dry run: negotiated immediate handover; no source fence or identity changes performed")
+	} else {
+		s.logger.Info("source demotion verified; proceeding without a slot wait")
 	}
 	// Save the received tower before later proof messages replace message data.
 	towerBytes := append([]byte(nil), f.message.ActiveNodeInfo.TowerFileBytes...)
 	towerHash := f.message.ActiveNodeInfo.TowerFileHash
 	if !s.isDryRunFailover {
-		for sequence := uint64(1); ; sequence++ {
-			f.message.Sequence = sequence
-			if err := sendPhase(f, "check-source"); err != nil {
-				return err
-			}
-			if err := receivePhase(f, proofTimeout); err != nil {
-				return fmt.Errorf("lost source fence proof: %w", err)
-			}
-			if f.message.Phase != "source-proof" || f.message.Sequence != sequence {
-				return fmt.Errorf("invalid source fence proof")
-			}
-			if err := f.message.SourceStatus.validate(sourcePassive, s.maxSlotLag); err != nil {
-				return err
-			}
-			local, err = s.safety.Snapshot(s.ctx)
-			if err != nil {
-				return err
-			}
-			if err := local.validate(destinationPassive, s.maxSlotLag); err != nil {
-				return err
-			}
-			if quiet == 0 || quietPeriodComplete(target, f.message.SourceStatus, local) {
-				break
-			}
-			select {
-			case <-s.ctx.Done():
-				return s.ctx.Err()
-			case <-time.After(s.pollInterval):
-			}
+		if err := s.safety.CheckReadiness(s.ctx, s.passiveNodeInfo.VoteAccount, activeKey, !transferTower); err != nil {
+			return err
 		}
-		// The wait may cross an epoch or an authority update. Re-read the
-		// on-chain authority and genesis immediately before the final mutation.
-		if err := s.safety.CheckReadiness(s.ctx, s.passiveNodeInfo.VoteAccount, activeKey, quiet != 0); err != nil {
+		if err := sendPhase(f, "check-source"); err != nil {
+			return err
+		}
+		if err := receivePhase(f, proofTimeout); err != nil {
+			return fmt.Errorf("lost source fence proof: %w", err)
+		}
+		if f.message.Phase != "source-proof" {
+			return fmt.Errorf("invalid source fence proof")
+		}
+		if err := f.message.SourceStatus.validate(sourcePassive, s.maxSlotLag); err != nil {
 			return err
 		}
 		local, err = s.safety.Snapshot(s.ctx)
@@ -312,11 +281,8 @@ func (s *Server) runDestination() (err error) {
 		if err := local.validate(destinationPassive, s.maxSlotLag); err != nil {
 			return err
 		}
-		if quiet != 0 && !quietPeriodComplete(target, f.message.SourceStatus, local) {
-			return fmt.Errorf("finalized slot guard no longer satisfied")
-		}
 		if s.passiveNodeInfo.Client == "agave" {
-			if quiet == 0 {
+			if transferTower {
 				if len(towerBytes) == 0 || source.ComputeTowerFileHashFromBytes(towerBytes) != towerHash {
 					return fmt.Errorf("invalid source tower payload")
 				}
@@ -329,7 +295,7 @@ func (s *Server) runDestination() (err error) {
 		}
 	}
 	f.SetPassiveNodeSetIdentityStartTime()
-	command := promotionCommand(s.passiveNodeInfo.SetIdentityCommand, quiet)
+	command := promotionCommand(s.passiveNodeInfo.SetIdentityCommand, transferTower)
 	if err := s.runCommand(s.ctx, command, s.isDryRunFailover); err != nil {
 		return fmt.Errorf("promotion outcome uncertain; no automatic rollback: %w", err)
 	}
@@ -348,7 +314,7 @@ func (s *Server) runDestination() (err error) {
 	f.SetFailoverEndSlot(local.Processed)
 	if !s.isDryRunFailover {
 		if s.passiveNodeInfo.VoteAccount != "" {
-			if err := s.waitForVote(activeKey, target); err != nil {
+			if err := s.waitForVote(activeKey, voteAnchor); err != nil {
 				return err
 			}
 		} else {

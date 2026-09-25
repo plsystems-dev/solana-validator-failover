@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"os/exec"
 	"strings"
 	"time"
@@ -14,17 +13,15 @@ import (
 )
 
 const (
-	NativeQuietSlots  = uint64(512)
 	DefaultMaxSlotLag = uint64(32)
 	rpcTimeout        = 8 * time.Second
 	commandTimeout    = 30 * time.Second
 	proofTimeout      = 20 * time.Second
-	guardPollInterval = 2 * time.Second
 )
 
 // RuntimeStatus is sampled after a fresh identity check, then checked again
-// before sending it. Source proofs are challenged on the authenticated stream;
-// an old proof cannot satisfy a later round.
+// before sending it. A source proof is sampled in response to a fresh challenge
+// on the authenticated stream, separately from the demotion acknowledgement.
 type RuntimeStatus struct {
 	Identity         string
 	Processed        uint64
@@ -211,59 +208,47 @@ func (s RuntimeStatus) validate(identity string, maxLag uint64) error {
 	return nil
 }
 
-func guardTarget(source, destination RuntimeStatus) (uint64, error) {
-	anchor := max(source.Processed, source.ClusterProcessed, destination.Processed, destination.ClusterProcessed)
-	if anchor > math.MaxUint64-NativeQuietSlots {
-		return 0, fmt.Errorf("slot guard overflow")
-	}
-	return anchor + NativeQuietSlots, nil
-}
-
-func quietPeriodComplete(target uint64, source, destination RuntimeStatus) bool {
-	return min(source.Finalized, source.ClusterFinalized, destination.Finalized, destination.ClusterFinalized) >= target
-}
-
-func negotiatedQuietSlots(source, destination *NodeInfo, skipTower, rollback, authenticated bool) (uint64, error) {
+func negotiateTowerTransfer(source, destination *NodeInfo, skipTower, rollback, authenticated bool) (bool, error) {
 	for _, n := range []*NodeInfo{source, destination} {
 		if n.Client != "agave" && n.Client != "firedancer" {
-			return 0, fmt.Errorf("unknown client capability %q", n.Client)
+			return false, fmt.Errorf("unknown client capability %q", n.Client)
 		}
 		if n.Identities == nil || n.Identities.Active == nil || n.Identities.Passive == nil {
-			return 0, fmt.Errorf("missing peer identities")
+			return false, fmt.Errorf("missing peer identities")
 		}
 		if n.Identities.Active.PubKey() == "" || n.Identities.Passive.PubKey() == "" || n.Identities.Active.PubKey() == n.Identities.Passive.PubKey() {
-			return 0, fmt.Errorf("active and passive identities must be nonempty and distinct")
+			return false, fmt.Errorf("active and passive identities must be nonempty and distinct")
 		}
 	}
 	if source.Identities.Active.PubKey() != destination.Identities.Active.PubKey() {
-		return 0, fmt.Errorf("active identities differ")
+		return false, fmt.Errorf("active identities differ")
 	}
 	if source.Identities.Passive.PubKey() == destination.Identities.Passive.PubKey() {
-		return 0, fmt.Errorf("passive identities must be distinct")
+		return false, fmt.Errorf("passive identities must be distinct")
 	}
 	if source.Client == "firedancer" || destination.Client == "firedancer" {
 		if source.VoteAccount == "" || source.VoteAccount != destination.VoteAccount {
-			return 0, fmt.Errorf("native peers must configure the same nonempty validator.vote_account")
+			return false, fmt.Errorf("native peers must configure the same nonempty validator.vote_account")
 		}
 		if !authenticated {
-			return 0, fmt.Errorf("native handover requires mTLS")
+			return false, fmt.Errorf("native handover requires mTLS")
 		}
 		if rollback {
-			return 0, fmt.Errorf("automatic rollback is unsupported for native handover; use a verified reverse handover")
+			return false, fmt.Errorf("automatic rollback is unsupported for native handover; use a verified reverse handover")
 		}
-		return NativeQuietSlots, nil
+		return false, nil
 	}
 	if skipTower {
-		return 0, fmt.Errorf("--skip-tower-sync is unsafe for Agave; use tower transfer")
+		return false, fmt.Errorf("--skip-tower-sync is unsafe for Agave; use tower transfer")
 	}
-	return 0, nil
+	return true, nil
 }
 
-// Existing command templates remain supported. In a guarded Agave destination
+// Existing command templates remain supported. In a mixed/native handover
 // there is no incoming tower, so only the standalone require-tower option is
 // removed. Native commands never receive Agave ledger/tower arguments.
-func promotionCommand(command string, quietSlots uint64) string {
-	if quietSlots == 0 {
+func promotionCommand(command string, transferTower bool) string {
+	if transferTower {
 		return command
 	}
 	args := strings.Fields(command)
